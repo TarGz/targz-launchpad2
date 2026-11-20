@@ -27,7 +27,12 @@ fn main() -> eframe::Result<()> {
         });
     }
 
+    // Without this eframe sets its own built-in egui logo as the Dock icon at
+    // runtime, overriding the .icns in the bundle (NativeOptions::viewport docs).
     let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_icon(std::sync::Arc::new(
+            eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png"),
+        ))
         .with_title("Targz Launchpad")
         .with_inner_size([1200.0, 800.0])
         .with_min_inner_size([420.0, 420.0]);
