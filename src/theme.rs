@@ -28,7 +28,8 @@ pub const TAG_TEXT: Color32 = hex(0x797e88);
 pub const FOLDER_TEXT: Color32 = hex(0xC99A5B);
 
 pub const R_CARD: f32 = 16.0;
-pub const R_SM: f32 = 10.0;
+/// Skew .key: border-radius 7px.
+pub const R_SM: f32 = 7.0;
 
 pub fn ui(size: f32) -> FontId {
     FontId::proportional(size)
@@ -139,9 +140,25 @@ pub fn shadow(p: &Painter, rect: Rect, r: impl Into<Rounding>, offset: Vec2, blu
 }
 
 /// The lit 1px top edge every raised part has.
+/// Skew's `inset 0 1px 0`: the lit top edge. It may only run along the FLAT
+/// part of the top, which starts one radius in — drawn any wider it floats
+/// over the corner curve, outside the key's silhouette. The radius is clamped
+/// like `Rounding` does, or a pill (radius 100) draws its rim in mid-air.
 pub fn rim(p: &Painter, rect: Rect, radius: f32, color: Color32) {
-    let y = rect.top() + 0.5;
-    p.line_segment([Pos2::new(rect.left() + radius * 0.7, y), Pos2::new(rect.right() - radius * 0.7, y)], Stroke::new(1.0, color));
+    edge(p, rect, radius, color, rect.top() + 0.5);
+}
+
+/// Skew's `inset 0 -1px 0`: the dark line under the bottom lip.
+pub fn underside(p: &Painter, rect: Rect, radius: f32, color: Color32) {
+    edge(p, rect, radius, color, rect.bottom() - 0.5);
+}
+
+fn edge(p: &Painter, rect: Rect, radius: f32, color: Color32, y: f32) {
+    let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let (a, b) = (rect.left() + r, rect.right() - r);
+    if b > a {
+        p.line_segment([Pos2::new(a, y), Pos2::new(b, y)], Stroke::new(1.0, color));
+    }
 }
 
 /// Skew's recess: a well cut into the face (inset shadows, lit lip below).
@@ -181,11 +198,11 @@ pub struct KeyLook {
 pub fn key_look(kind: KeyKind, hover: bool) -> KeyLook {
     match kind {
         KeyKind::Metal => KeyLook {
-            stops: if hover { [(0.0, hex(0x343841)), (0.5, hex(0x2c2f36)), (1.0, hex(0x24262b))] } else { [(0.0, hex(0x2c2f34)), (0.5, hex(0x25272c)), (1.0, hex(0x1e2024))] },
-            text: if hover { hex(0xdfe2e7) } else { TEXT_2 },
+            stops: if hover { [(0.0, hex(0x3b3f46)), (0.52, hex(0x2a2d32)), (1.0, hex(0x1e2024))] } else { [(0.0, hex(0x34373d)), (0.52, hex(0x232529)), (1.0, hex(0x1a1c20))] },
+            text: if hover { hex(0xe2e5ea) } else { TEXT_2 },
             ledge: hex(0x0e0f11),
             glow: None,
-            rim: rgba(255, 255, 255, 0.13),
+            rim: rgba(255, 255, 255, 0.16),
             border: None,
         },
         KeyKind::Launch => KeyLook {
@@ -213,11 +230,11 @@ pub fn key_look(kind: KeyKind, hover: bool) -> KeyLook {
             border: None,
         },
         KeyKind::Danger => KeyLook {
-            stops: if hover { [(0.0, hex(0x8E1F1F)), (0.55, hex(0x661616)), (1.0, hex(0x490F0F))] } else { [(0.0, hex(0x2c2f34)), (0.5, hex(0x25272c)), (1.0, hex(0x1e2024))] },
+            stops: if hover { [(0.0, hex(0x8E1F1F)), (0.55, hex(0x661616)), (1.0, hex(0x490F0F))] } else { [(0.0, hex(0x34373d)), (0.52, hex(0x232529)), (1.0, hex(0x1a1c20))] },
             text: if hover { Color32::WHITE } else { hex(0xFF9B9B) },
             ledge: hex(0x0e0f11),
             glow: None,
-            rim: rgba(255, 255, 255, 0.13),
+            rim: rgba(255, 255, 255, 0.16),
             border: Some(hex(0x490F0F)),
         },
     }
@@ -225,16 +242,32 @@ pub fn key_look(kind: KeyKind, hover: bool) -> KeyLook {
 
 /// A raised key: drop shadow, ledge, gradient face, lit rim, optional glow.
 pub fn paint_key(p: &Painter, rect: Rect, r: impl Into<Rounding> + Copy, look: &KeyLook, pressed: bool) {
-    let face = if pressed { rect.translate(Vec2::new(0.0, 1.0)) } else { rect };
+    let radius = r.into().nw;
     if let Some(g) = look.glow {
         shadow(p, rect, r, Vec2::ZERO, 12.0, 0.0, g);
     }
-    shadow(p, rect, r, Vec2::new(0.0, if pressed { 2.0 } else { 3.0 }), 6.0, 0.0, rgba(0, 0, 0, 0.6));
-    p.rect_filled(rect.translate(Vec2::new(0.0, if pressed { 1.0 } else { 2.0 })), r, look.ledge);
-    vgrad(p, face, r, &look.stops);
-    rim(p, face, r.into().nw, look.rim);
+    if pressed {
+        // Skew .key:active — the cap sinks a full 2px onto its own ledge, so the
+        // ledge is gone, the drop shadow tightens, and the face gradient flips:
+        // the light is now under the lip instead of on it.
+        let face = rect.translate(Vec2::new(0.0, 2.0));
+        shadow(p, face, r, Vec2::new(0.0, 1.0), 2.0, 0.0, rgba(0, 0, 0, 0.6));
+        let s = look.stops;
+        vgrad(p, face, r, &[(0.0, s[2].1), (0.48, s[1].1), (1.0, s[0].1)]);
+        rim(p, face, radius, rgba(0, 0, 0, 0.8));
+        underside(p, face, radius, rgba(255, 255, 255, 0.07));
+        if let Some(b) = look.border {
+            p.rect_stroke(face.shrink(0.5), r, Stroke::new(1.0, b));
+        }
+        return;
+    }
+    shadow(p, rect, r, Vec2::new(0.0, 3.0), 5.0, 0.0, rgba(0, 0, 0, 0.65));
+    p.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), r, look.ledge);
+    vgrad(p, rect, r, &look.stops);
+    rim(p, rect, radius, look.rim);
+    underside(p, rect, radius, rgba(0, 0, 0, 0.7));
     if let Some(b) = look.border {
-        p.rect_stroke(face.shrink(0.5), r, Stroke::new(1.0, b));
+        p.rect_stroke(rect.shrink(0.5), r, Stroke::new(1.0, b));
     }
 }
 
