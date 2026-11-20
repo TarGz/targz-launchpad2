@@ -153,12 +153,37 @@ pub fn underside(p: &Painter, rect: Rect, radius: f32, color: Color32) {
     edge(p, rect, radius, color, rect.bottom() - 0.5);
 }
 
+/// In CSS `inset 0 1px 0` follows the border-radius, so the lit edge bends into
+/// the corner and is lost there — it never stops dead. A straight line cannot
+/// bend, so it has to die out instead: full strength just past the left corner,
+/// trailing away to nothing at the right. That is also where Skew's one lamp is,
+/// above-left, which is why the falloff is longer on the far side than the near.
 fn edge(p: &Painter, rect: Rect, radius: f32, color: Color32, y: f32) {
     let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
     let (a, b) = (rect.left() + r, rect.right() - r);
-    if b > a {
-        p.line_segment([Pos2::new(a, y), Pos2::new(b, y)], Stroke::new(1.0, color));
+    if b <= a {
+        return;
     }
+    const N: u32 = 32;
+    let mut m = epaint::Mesh::default();
+    for i in 0..=N {
+        let t = i as f32 / N as f32;
+        let c = fade(color, smoothstep(t / 0.28) * smoothstep((1.0 - t) / 0.62));
+        let x = a + (b - a) * t;
+        m.colored_vertex(Pos2::new(x, y - 0.5), c);
+        m.colored_vertex(Pos2::new(x, y + 0.5), c);
+    }
+    for i in 0..N {
+        let (q, s) = (i * 2, i * 2 + 2);
+        m.add_triangle(q, q + 1, s);
+        m.add_triangle(q + 1, s, s + 1);
+    }
+    p.add(Shape::mesh(m));
+}
+
+fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// Skew's recess: a well cut into the face (inset shadows, lit lip below).
