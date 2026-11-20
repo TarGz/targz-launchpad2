@@ -63,6 +63,18 @@ fn current_bundle() -> Option<PathBuf> {
     exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf)
 }
 
+/// `git pull --ff-only` in one of the user's projects. --ff-only so a pull can
+/// never open an editor or leave a half-made merge; the timeout and
+/// GIT_TERMINAL_PROMPT=0 (set by `git`) keep an HTTPS credential prompt from
+/// hanging the thread. Err carries the first error line.
+pub fn pull(dir: &Path) -> Result<String, String> {
+    if !dir.join(".git").exists() {
+        return Err("Not a git repository".into());
+    }
+    let out = git(dir, &["pull", "--ff-only"], Duration::from_secs(30))?;
+    Ok(out.lines().next().filter(|l| !l.is_empty()).unwrap_or("Pulled").to_string())
+}
+
 /// Latest GitHub release: (build number, zip download URL).
 fn latest_release(repo: &str) -> Result<(u32, String), String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");

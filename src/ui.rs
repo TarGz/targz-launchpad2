@@ -37,6 +37,8 @@ enum Action {
     OpenUrl(u16),
     Editor(PathBuf),
     Finder(PathBuf),
+    Terminal(PathBuf),
+    Pull(PathBuf),
     StopAll,
     Refresh,
     Update,
@@ -638,6 +640,24 @@ impl App {
                         c.toasts.push(format!("Edit failed: {e}"));
                     }
                 }
+                Action::Terminal(p) => {
+                    let mut c = self.shared.lock().unwrap();
+                    if let Err(e) = core::open_terminal(&c.cfg, &p) {
+                        c.toasts.push(format!("Terminal failed: {e}"));
+                    }
+                }
+                Action::Pull(p) => {
+                    let s = self.shared.clone();
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    std::thread::spawn(move || {
+                        let msg = match crate::update::pull(&p) {
+                            Ok(m) => format!("{name}: {m}"),
+                            Err(e) => format!("{name}: {e}"),
+                        };
+                        s.lock().unwrap().toasts.push(msg);
+                        repaint();
+                    });
+                }
                 Action::Refresh => {
                     let s = self.shared.clone();
                     std::thread::spawn(move || {
@@ -861,25 +881,43 @@ fn card(ui: &mut Ui, rect: Rect, c: &Card, t: f64, focused: bool, actions: &mut 
             actions.push(Action::Launch(c.name.clone()));
         }
     }
-    // tools: editor + Finder, one quiet segmented metal control
-    let tools = Rect::from_min_size(Pos2::new(x1 - 72.0, ay), Vec2::new(72.0, 36.0));
+    // tools: editor, Finder, terminal, git pull — one quiet segmented metal control
+    const TOOLS: [&str; 4] = ["Open in editor", "Reveal in Finder", "Open in terminal", "git pull --ff-only"];
+    const TOOL_W: f32 = 36.0;
+    let tools = Rect::from_min_size(Pos2::new(x1 - TOOL_W * TOOLS.len() as f32, ay), Vec2::new(TOOL_W * TOOLS.len() as f32, 36.0));
     paint_key(&p, tools, R_SM, &key_look(KeyKind::Metal, false), false);
-    p.line_segment([Pos2::new(tools.center().x, tools.top() + 1.0), Pos2::new(tools.center().x, tools.bottom() - 1.0)], Stroke::new(1.0, rgba(0, 0, 0, 0.5)));
-    for (i, (tip, which)) in [("Open in editor", 0), ("Reveal in Finder", 1)].iter().enumerate() {
-        let r = Rect::from_min_size(Pos2::new(tools.left() + 36.0 * i as f32, tools.top()), Vec2::new(36.0, 36.0));
+    for i in 1..TOOLS.len() {
+        let gx = tools.left() + TOOL_W * i as f32;
+        p.line_segment([Pos2::new(gx, tools.top() + 1.0), Pos2::new(gx, tools.bottom() - 1.0)], Stroke::new(1.0, rgba(0, 0, 0, 0.5)));
+    }
+    for (i, tip) in TOOLS.iter().enumerate() {
+        let r = Rect::from_min_size(Pos2::new(tools.left() + TOOL_W * i as f32, tools.top()), Vec2::new(TOOL_W, 36.0));
         let resp = ui.interact(r, id.with(("tool", i)), Sense::click());
         if resp.hovered() {
-            p.rect_filled(r.shrink(1.0), if i == 0 { egui::Rounding { nw: R_SM, sw: R_SM, ne: 0.0, se: 0.0 } } else { egui::Rounding { nw: 0.0, sw: 0.0, ne: R_SM, se: R_SM } }, rgba(255, 255, 255, 0.06));
+            let round = if i == 0 {
+                egui::Rounding { nw: R_SM, sw: R_SM, ne: 0.0, se: 0.0 }
+            } else if i == TOOLS.len() - 1 {
+                egui::Rounding { nw: 0.0, sw: 0.0, ne: R_SM, se: R_SM }
+            } else {
+                egui::Rounding::ZERO
+            };
+            p.rect_filled(r.shrink(1.0), round, rgba(255, 255, 255, 0.06));
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let col = if resp.hovered() { hex(0xdfe2e7) } else { TEXT_2 };
-        if *which == 0 {
-            icon_code(&p, r.center(), 15.0, col);
-        } else {
-            icon_folder(&p, r.center(), 15.0, col, 1.6);
+        match i {
+            0 => icon_code(&p, r.center(), 15.0, col),
+            1 => icon_folder(&p, r.center(), 15.0, col, 1.6),
+            2 => icon_terminal(&p, r.center(), 15.0, col),
+            _ => icon_download(&p, r.center(), 15.0, col),
         }
         if resp.on_hover_text(*tip).clicked() {
-            actions.push(if *which == 0 { Action::Editor(c.path.clone()) } else { Action::Finder(c.path.clone()) });
+            actions.push(match i {
+                0 => Action::Editor(c.path.clone()),
+                1 => Action::Finder(c.path.clone()),
+                2 => Action::Terminal(c.path.clone()),
+                _ => Action::Pull(c.path.clone()),
+            });
         }
     }
 

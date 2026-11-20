@@ -28,8 +28,9 @@ fi
 
 BUNDLE="target/$NAME.app"
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS"
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp target/release/targz-launchpad "$BUNDLE/Contents/MacOS/targz-launchpad"
+cp icon.icns "$BUNDLE/Contents/Resources/icon.icns"
 cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,6 +39,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleDisplayName</key><string>$NAME</string>
   <key>CFBundleIdentifier</key><string>com.targz.launchpad.rust</string>
   <key>CFBundleExecutable</key><string>targz-launchpad</string>
+  <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>${LAUNCHPAD_BUILD:-$VERSION}</string>

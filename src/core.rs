@@ -21,6 +21,11 @@ pub const WAIT_NODE: Duration = Duration::from_millis(5000);
 pub const WAIT_JEKYLL: Duration = Duration::from_millis(15000);
 pub const WAIT_STATIC: Duration = Duration::from_millis(5000);
 pub const WAIT_POLL: Duration = Duration::from_millis(300);
+/// Terminal order: macOS has no "default terminal" setting to ask for, so the
+/// first installed wins unless ~/.devlauncher.json names one ("terminal").
+/// Terminal.app is the fallback: it lives in /System/Applications, so it never
+/// shows up in the scan below, but it is always there.
+const TERMINALS: [&str; 2] = ["Terminass", "iTerm"];
 /// Editor order, as stored in the server's constant pool at 0x102d1db2b.
 const EDITORS: [&str; 9] = [
     "Zed", "Cursor", "Visual Studio Code", "VSCodium", "Windsurf", "Sublime Text", "Nova", "WebStorm", "BBEdit",
@@ -792,6 +797,21 @@ pub fn open_editor(cfg: &Config, dir: &Path) -> Result<String, String> {
     let editor = editor.ok_or("No code editor found in /Applications")?;
     Command::new("open").arg("-a").arg(&editor).arg(dir).spawn().map_err(|e| e.to_string())?;
     Ok(editor)
+}
+
+/// Open a project folder in a terminal. `open -a <term> <dir>` only: osascript
+/// would make the signed binary ask for Automation permission on first run.
+pub fn open_terminal(cfg: &Config, dir: &Path) -> Result<String, String> {
+    let term = cfg
+        .get_str("terminal")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let dirs = [PathBuf::from("/Applications"), home().join("Applications")];
+            TERMINALS.iter().find(|app| dirs.iter().any(|d| d.join(format!("{app}.app")).exists())).map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "Terminal".to_string());
+    Command::new("open").arg("-a").arg(&term).arg(dir).spawn().map_err(|e| e.to_string())?;
+    Ok(term)
 }
 
 #[cfg(test)]

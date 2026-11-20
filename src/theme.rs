@@ -342,6 +342,18 @@ pub fn icon_download(p: &Painter, c: Pos2, s: f32, col: Color32) {
     p.line_segment([c + Vec2::new(-h, h), c + Vec2::new(h, h)], st);
 }
 
+pub fn icon_terminal(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let st = Stroke::new(1.5, col);
+    let w = s * 0.44;
+    let h = s * 0.34;
+    p.rect_stroke(Rect::from_center_size(c, Vec2::new(w * 2.0, h * 2.0)), 2.0, st);
+    p.add(Shape::line(
+        vec![c + Vec2::new(-w * 0.52, -h * 0.42), c + Vec2::new(-w * 0.12, h * 0.02), c + Vec2::new(-w * 0.52, h * 0.46)],
+        st,
+    ));
+    p.line_segment([c + Vec2::new(w * 0.12, h * 0.46), c + Vec2::new(w * 0.6, h * 0.46)], st);
+}
+
 pub fn spinner(p: &Painter, c: Pos2, r: f32, t: f64, col: Color32) {
     p.circle_stroke(c, r, Stroke::new(2.0, rgba(255, 255, 255, 0.15)));
     let a0 = (t * 10.0) as f32;
