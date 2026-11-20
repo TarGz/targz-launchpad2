@@ -1,0 +1,43 @@
+# Every push to main builds the app on a Mac runner and publishes it as a
+# GitHub release named build-<N>. Installed copies see it and offer to update.
+name: Build and release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the app (Apple Silicon + Intel)
+        env:
+          LAUNCHPAD_BUILD: ${{ github.run_number }}
+          LAUNCHPAD_REPO: ${{ github.repository }}
+          UNIVERSAL: "1"
+          NO_INSTALL: "1"
+        run: ./install.sh
+
+      - name: Zip it
+        run: cd target && ditto -c -k --keepParent "Targz Launchpad Rust.app" ../Targz-Launchpad.zip
+
+      - name: Publish release build-${{ github.run_number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          printf '%s\n' "${NOTES:-Manual build}" > notes.txt
+          gh release create "build-${{ github.run_number }}" Targz-Launchpad.zip \
+            --title "Build ${{ github.run_number }}" --notes-file notes.txt --latest
