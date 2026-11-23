@@ -476,6 +476,19 @@ pub enum Busy {
     Restarting,
 }
 
+/// What a module last reported — the line the card shows under its keys.
+/// `Run` is a git pull in flight, 0–100; `Ok` and `Err` carry git's own words
+/// or the launcher's, verbatim. An `Err` stays until it is answered.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Report {
+    Run(u8),
+    Ok(String),
+    /// a pull failed — RETRY pulls again
+    Err(String),
+    /// the launcher failed — RETRY launches again
+    Fail(String),
+}
+
 #[derive(Default, Clone)]
 pub struct UpdateState {
     pub repo: Option<PathBuf>,
@@ -486,6 +499,10 @@ pub struct UpdateState {
     /// zip of a newer GitHub release, when there is one
     pub download: Option<String>,
     pub message: String,
+    /// what the newer version calls itself, for the UPDATE key's legend
+    pub latest: Option<String>,
+    /// the last check could not reach the server
+    pub failed: bool,
 }
 
 pub struct Core {
@@ -493,6 +510,8 @@ pub struct Core {
     pub projects: Vec<Project>,
     pub running: HashMap<String, Run>,
     pub busy: HashMap<String, Busy>,
+    /// per project: the last thing it said, by project name
+    pub reports: HashMap<String, Report>,
     pub toasts: Vec<String>,
     pub path_env: String,
     pub update: UpdateState,
@@ -509,6 +528,7 @@ impl Core {
             projects,
             running: HashMap::new(),
             busy: HashMap::new(),
+            reports: HashMap::new(),
             toasts: vec![],
             path_env: format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default()),
             update: UpdateState::default(),
@@ -753,11 +773,21 @@ fn start_blocking(shared: &Shared, name: &str) {
     };
     match spawned {
         Ok((port, timeout)) => {
-            if !wait_for_server(port, timeout) {
-                shared.lock().unwrap().toasts.push(format!("{name} is not answering on :{port} yet"));
+            let answered = wait_for_server(port, timeout);
+            let mut c = shared.lock().unwrap();
+            match answered {
+                // a started server needs no line: the port strip is the receipt
+                true => {
+                    c.reports.remove(name);
+                }
+                false => {
+                    c.reports.insert(name.to_string(), Report::Fail(format!("no answer on :{port} yet")));
+                }
             }
         }
-        Err(e) => shared.lock().unwrap().toasts.push(format!("Failed to start: {e}")),
+        Err(e) => {
+            shared.lock().unwrap().reports.insert(name.to_string(), Report::Fail(e));
+        }
     }
 }
 

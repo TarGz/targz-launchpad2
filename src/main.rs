@@ -4,7 +4,6 @@
 mod core;
 #[cfg(target_os = "macos")]
 mod tray;
-mod theme;
 mod ui;
 mod update;
 

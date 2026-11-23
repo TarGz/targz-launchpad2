@@ -1,11 +1,17 @@
 [package]
 name = "targz-launchpad"
-version = "1.1.5"
+version = "1.3.0"
 edition = "2021"
 description = "Menu-bar launcher for the local dev projects in ~/Documents/GIT"
 
 [dependencies]
 eframe = "0.29"
+# Skew — the targz design system — as painted egui parts. A git dependency
+# pinned by revision, because CI checks out this repo alone and cannot see
+# ../targz-design-system (rust/skew-egui/README.md, "How an app takes it").
+# Moving this rev is the only way a design-system commit changes these pixels.
+# default-features = false: the crate's key-click sound bank stays off.
+skew-egui = { git = "https://github.com/TarGz/targz-design-system.git", rev = "ac90e9e6c92c7dbba89b2e8e36835bdd672ad47b", default-features = false }
 winit = "0.30"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -17,6 +23,13 @@ dispatch = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSEnumerator"] }
+
+# While changing a part and this app at the same time, point the dependency at
+# the local checkout — and take this block out again before pushing, because CI
+# cannot see that folder:
+#
+# [patch."https://github.com/TarGz/targz-design-system.git"]
+# skew-egui = { path = "../targz-design-system/rust/skew-egui" }
 
 [profile.release]
 opt-level = 3

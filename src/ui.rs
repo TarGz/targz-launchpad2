@@ -1,33 +1,85 @@
-//! The dashboard window: header, folder chips + filter, the card rack.
+//! The dashboard window, built from the design system's launcher parts
+//! (`skew-egui`, `docs/skew-panels.html` § 06 Launchpad, and the running
+//! `cargo run --example gallery` § 06 that is its port): the console, one
+//! strip of boxes, the running switch, and one module card per project.
+//! Nothing here paints a key or a well by hand — the drawings are the
+//! crate's, and the pixels move only when its pinned `rev` moves.
+//!
+//! THE LAUNCHER IS A WINDOW, NOT A PANEL. The ruled desk is INSIDE the
+//! `console` and the ground around it stays plain, because the desk belongs
+//! to the application and not to the document it is scrolling.
 
-use crate::core::{self, Busy, Kind, Shared, UpdateState};
-use crate::theme::*;
+use crate::core::{self, Busy, Report, Shared, UpdateState};
 use eframe::egui::{
-    self, text::LayoutJob, text::TextWrapping, Align2, Color32, Context, DragAndDrop, Event, Id, Key, LayerId, Order, Pos2, Rect, Response,
-    RichText, Sense, Stroke, TextFormat, Ui, UiBuilder, Vec2, ViewportCommand,
+    self, pos2, vec2, Align, Align2, Color32, Context, Event, Id, Key, LayerId, Layout, Order, Rect, Sense, Stroke, Ui, Vec2,
+    ViewportCommand,
+};
+use skew_egui::{
+    act, channel, con_say, console, empty_rack, mono, module_card, sel, sel_list, sel_list_size, slide, slot_field,
+    version_readout_h, ActStyle, Icon, Lens, ModuleHit, ModuleView, Part, PullHit, PullState, SlideKind, Theme, VerState,
+    MODULE_MIN_W,
 };
 use std::path::PathBuf;
 use std::time::Duration;
+use std::collections::HashMap;
 
-const CARD_MIN_W: f32 = 340.0;
-const GAP: f32 = 16.0;
-const CARD_H: f32 = 228.0;
 const MAX_W: f32 = 1200.0;
-const PAD_X: f32 = 40.0;
-const PAD_Y: f32 = 32.0;
+const PAD: f32 = 24.0;
+const GAP: f32 = 14.0;
+/// One control height for the whole strip: `.con-top` cuts every box in that
+/// row — the selector, the field, the keys, the readout — to one height.
+const CAP: f32 = 32.0;
+/// How long a finished report stays on a card before it leaves on its own.
+const REPORT_LINGER: f64 = 5.0;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The two values that are not folders, and they lead the list. `ALL FOLDERS`
+/// and `NO FOLDER` are filters; everything after them is a folder you can
+/// rename and delete. The folder commands split on exactly that line.
+const ALL: &str = "ALL FOLDERS";
+const NONE: &str = "NO FOLDER";
+
+/// Which inline edit the strip is in, if any. `None` is the resting row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    /// Naming a folder that does not exist yet — so there is no bin.
+    New,
+    /// Renaming the one that is picked — bin, field, tick.
+    Rename,
+}
 
 struct Card {
     name: String,
-    group: Option<String>,
-    short: String,
-    desc: String,
-    kind: Kind,
     port: Option<u16>,
     running: bool,
     busy: Option<Busy>,
+    /// Every folder this project is filed in. The card stamps the first and
+    /// carries the rest as tags; the drawer writes exactly one.
     folders: Vec<String>,
     path: PathBuf,
+    report: Option<Report>,
+}
+
+impl Card {
+    /// The line the card shows under its keys: what it is doing now, or the
+    /// last thing it said. Busy wins — it is live, a report is history.
+    fn line(&self) -> Option<PullState> {
+        match (self.busy, &self.report) {
+            (Some(Busy::Starting), _) => Some(PullState::Ok("starting…".into())),
+            (Some(Busy::Restarting), _) => Some(PullState::Ok("restarting…".into())),
+            (Some(Busy::Stopping), _) => Some(PullState::Ok("stopping…".into())),
+            (None, Some(Report::Run(p))) => Some(PullState::Run(*p)),
+            (None, Some(Report::Ok(m))) => Some(PullState::Ok(m.clone())),
+            (None, Some(Report::Err(m))) | (None, Some(Report::Fail(m))) => Some(PullState::Err(m.clone())),
+            (None, None) => None,
+        }
+    }
+
+    /// The folder stamped on the card. Empty prints `NO FOLDER`, which is a
+    /// value and not a missing control.
+    fn folder(&self) -> &str {
+        self.folders.first().map(String::as_str).unwrap_or("")
+    }
 }
 
 enum Action {
@@ -38,80 +90,148 @@ enum Action {
     Editor(PathBuf),
     Finder(PathBuf),
     Terminal(PathBuf),
-    Pull(PathBuf),
+    Pull(String, PathBuf),
+    Dismiss(String),
     StopAll,
     Refresh,
     Update,
     CheckUpdate,
-    Assign(String, String, bool),
-    NewFolder,
-    EditFolder(String),
-}
-
-enum ModalMode {
-    New,
-    Edit(String),
-}
-
-struct Modal {
-    mode: ModalMode,
-    text: String,
-    error: String,
-    focused: bool,
+    /// The card drawer writes a project's folder: exactly one, or none.
+    SetFolder(String, Option<String>),
 }
 
 pub struct App {
     shared: Shared,
+    th: Theme,
     search: String,
-    folder: Option<String>,
-    modal: Option<Modal>,
+    /// `ALL FOLDERS`, `NO FOLDER`, or a folder's name.
+    folder: String,
+    only_up: bool,
+    /// the strip's inline edit, and the name being typed into it
+    edit: Option<Edit>,
+    buf: String,
+    focus_buf: bool,
+    /// the folder the bin has armed — the row becomes the question
+    del: Option<String>,
+    /// the folder selector's plate is open
+    list: bool,
+    sel_rect: Rect,
+    /// the card whose folder drawer is open, and whether its plate is up
+    card: Option<String>,
+    card_list: bool,
+    card_rect: Rect,
     toast: Option<(String, f64)>,
     shot: Option<PathBuf>,
     frames: u64,
     focus_search: bool,
+    /// The filter field's own id, as egui minted it. `/` and Escape act on the
+    /// field that is actually there, not on a name we hoped it would take.
+    filter_id: Option<Id>,
+    /// when a finished report should leave, by project name
+    linger: HashMap<String, f64>,
+    ver: VerState,
+    ver_checking: bool,
+    ver_t0: f64,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, shot: Option<PathBuf>) -> App {
-        install_fonts(&cc.egui_ctx);
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BOARD;
-        visuals.extreme_bg_color = BAY;
-        visuals.selection.bg_fill = rgba(255, 106, 0, 0.35);
-        visuals.text_cursor.stroke = Stroke::new(1.5, LED);
-        cc.egui_ctx.set_visuals(visuals);
-        App { shared, search: String::new(), folder: None, modal: None, toast: None, shot, frames: 0, focus_search: false }
+        // The light skin is the tuned one: every pixel in the crate's keys and
+        // wells was approved against it (skew-egui/README.md).
+        let th = Theme::light();
+        th.apply(&cc.egui_ctx);
+        App {
+            shared,
+            th,
+            search: String::new(),
+            folder: ALL.to_string(),
+            only_up: false,
+            edit: None,
+            buf: String::new(),
+            focus_buf: false,
+            del: None,
+            list: false,
+            sel_rect: Rect::NOTHING,
+            card: None,
+            card_list: false,
+            card_rect: Rect::NOTHING,
+            toast: None,
+            shot,
+            frames: 0,
+            focus_search: false,
+            filter_id: None,
+            linger: HashMap::new(),
+            ver: VerState::Idle(stamp()),
+            ver_checking: false,
+            ver_t0: 0.0,
+        }
     }
 
-    fn snapshot(&mut self, now: f64) -> (Vec<Card>, Vec<(String, usize)>, usize, String, UpdateState) {
+    /// One read of the shared state per frame — and the one write: a finished
+    /// report that has had its time on screen is dropped here.
+    fn snapshot(&mut self, now: f64) -> (Vec<Card>, Vec<String>, usize, String, UpdateState) {
         let mut c = self.shared.lock().unwrap();
         if let Some(t) = c.toasts.pop() {
             self.toast = Some((t, now));
             c.toasts.clear();
         }
+        // a done line leaves on its own; a failed one stays until it is answered
+        let done: Vec<String> = c
+            .reports
+            .iter()
+            .filter(|(_, r)| matches!(r, Report::Ok(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in done {
+            if c.busy.contains_key(&n) {
+                continue;
+            }
+            match self.linger.get(&n).copied() {
+                None => {
+                    self.linger.insert(n, now + REPORT_LINGER);
+                }
+                Some(t) if now > t => {
+                    c.reports.remove(&n);
+                    self.linger.remove(&n);
+                }
+                Some(_) => {}
+            }
+        }
+        self.linger.retain(|n, _| matches!(c.reports.get(n), Some(Report::Ok(_))));
         let cards: Vec<Card> = c
             .projects
             .iter()
             .map(|p| Card {
                 name: p.name.clone(),
-                group: p.group.clone(),
-                short: p.name.rsplit('/').next().unwrap_or(&p.name).to_string(),
-                desc: p.description.clone(),
-                kind: p.kind,
                 port: c.port_of(p),
                 running: c.running.contains_key(&p.name),
                 busy: c.busy.get(&p.name).copied(),
                 folders: c.cfg.folders_for(&p.name),
                 path: p.path.clone(),
+                report: c.reports.get(&p.name).cloned(),
             })
             .collect();
-        let folders = c.cfg.folders.iter().map(|f| (f.clone(), cards.iter().filter(|p| p.folders.contains(f)).count())).collect();
-        if let Some(f) = &self.folder {
-            if !c.cfg.folders.contains(f) {
-                self.folder = None;
+        let folders = c.cfg.folders.clone();
+        // a folder deleted under the selector leaves it pointing at nothing
+        if self.folder != ALL && self.folder != NONE && !folders.contains(&self.folder) {
+            self.folder = ALL.to_string();
+        }
+        if let Some(n) = &self.card {
+            if !cards.iter().any(|p| &p.name == n) {
+                self.card = None;
+                self.card_list = false;
             }
         }
         (cards, folders, c.running.len(), c.cfg.git_dir_label.clone(), c.update.clone())
+    }
+
+    /// Which projects survive the three filters. Each one is applied to the
+    /// result of the last: folder, then running, then text.
+    fn in_filter(&self, p: &Card) -> bool {
+        let by_folder = self.folder == ALL
+            || (self.folder == NONE && p.folders.is_empty())
+            || p.folders.iter().any(|f| *f == self.folder);
+        by_folder && (!self.only_up || p.running)
     }
 
     fn matches(&self, p: &Card) -> bool {
@@ -119,51 +239,126 @@ impl App {
         if q.is_empty() {
             return true;
         }
-        let mut hay = vec![p.name.as_str(), p.desc.as_str(), p.kind.label()];
-        hay.extend(p.folders.iter().map(String::as_str));
-        hay.iter().any(|s| s.to_lowercase().contains(&q))
+        let hay = format!("{} {}", p.name, p.folders.join(" ")).to_lowercase();
+        hay.contains(&q)
+    }
+
+    fn filtering(&self) -> bool {
+        !self.search.trim().is_empty() || self.folder != ALL || self.only_up
+    }
+
+    /// A NAMED folder is picked — so RENAME and DELETE have an object. They
+    /// are PRESENT OR ABSENT rather than enabled or greyed, because a key that
+    /// is there and dead still has to be read before it can be dismissed.
+    fn named(&self) -> bool {
+        self.folder != ALL && self.folder != NONE
+    }
+
+    /// `[ALL FOLDERS, NO FOLDER, …folders]` — the selector's values.
+    fn opts(&self, folders: &[String]) -> Vec<String> {
+        let mut v = vec![ALL.to_string(), NONE.to_string()];
+        v.extend(folders.iter().cloned());
+        v
+    }
+
+    /// Enter commits. An empty name is a cancel, because a folder with no
+    /// name is not a folder. A name core refuses — a duplicate — leaves the
+    /// field open with what you typed still in it, and says why in a toast.
+    fn commit(&mut self) {
+        let Some(mode) = self.edit else { return };
+        let v = self.buf.trim().to_string();
+        if v.is_empty() {
+            self.edit = None;
+            return;
+        }
+        let was = self.folder.clone();
+        let res = {
+            let mut c = self.shared.lock().unwrap();
+            match mode {
+                Edit::New => c.cfg.create_folder(&v),
+                Edit::Rename => c.cfg.rename_folder(&was, &v),
+            }
+        };
+        match res {
+            Ok(()) => {
+                self.folder = v;
+                self.edit = None;
+            }
+            // the field stays open with what you typed — and focused, because
+            // Enter has already blurred it and a field you cannot type in is
+            // not an open field
+            Err(e) => {
+                self.shared.lock().unwrap().toasts.push(e);
+                self.focus_buf = true;
+            }
+        }
+    }
+
+    /// The bin arms; the row states the consequence and offers CANCEL and
+    /// DELETE. Two presses, which is the whole of the protection — what went
+    /// is the room you had to be sent to, not the stop.
+    fn do_delete(&mut self) {
+        let Some(was) = self.del.take() else { return };
+        self.shared.lock().unwrap().cfg.delete_folder(&was);
+        if self.folder == was {
+            self.folder = ALL.to_string();
+        }
+    }
+
+    /// `UpdateState` as the readout's own state machine. UP TO DATE and CHECK
+    /// FAILED are flashes: they show what the check found, then the readout
+    /// goes back to being a version.
+    fn ver_state(&mut self, u: &UpdateState, now: f64) -> VerState {
+        if u.busy {
+            // no download reports bytes, so the percentage is the phase it is
+            // in — the words in `update.message` are the real report
+            let pct = match u.message.as_str() {
+                m if m.starts_with("Downloading") => 25,
+                m if m.starts_with("Building") => 65,
+                m if m.starts_with("Unzip") => 80,
+                _ => 5,
+            };
+            self.ver_checking = false;
+            return VerState::Updating(pct);
+        }
+        if u.checking {
+            self.ver_checking = true;
+            return VerState::Checking;
+        }
+        if self.ver_checking {
+            // the check just landed
+            self.ver_checking = false;
+            self.ver_t0 = now;
+            self.ver = if u.failed {
+                VerState::Failed
+            } else if u.behind > 0 {
+                VerState::Available(u.latest.clone().unwrap_or_else(|| "AVAILABLE".into()))
+            } else {
+                VerState::Latest
+            };
+        }
+        if u.behind > 0 {
+            return VerState::Available(u.latest.clone().unwrap_or_else(|| "AVAILABLE".into()));
+        }
+        match &self.ver {
+            VerState::Latest | VerState::Failed if now - self.ver_t0 < 2.6 => self.ver.clone(),
+            _ => VerState::Idle(stamp()),
+        }
     }
 }
 
-fn text_w(ui: &Ui, s: &str, font: egui::FontId) -> f32 {
-    ui.fonts(|f| f.layout_no_wrap(s.to_string(), font, Color32::WHITE).size().x)
-}
-
-/// A clickable key with painted contents.
-fn key(ui: &mut Ui, rect: Rect, id: Id, kind: KeyKind, r: f32, enabled: bool, draw: impl FnOnce(&egui::Painter, Rect, Color32)) -> Response {
-    let resp = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
-    let hover = enabled && resp.hovered();
-    let pressed = enabled && resp.is_pointer_button_down_on();
-    let look = key_look(kind, hover);
-    let p = ui.painter();
-    paint_key(p, rect, r, &look, pressed);
-    let face = if pressed { rect.translate(Vec2::new(0.0, 1.0)) } else { rect };
-    draw(p, face, if enabled { look.text } else { fade(look.text, 0.5) });
-    if hover {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+/// What this copy calls itself: the crate version, and the build number when
+/// the GitHub workflow baked one in — the only way to see an auto-update land.
+fn stamp() -> String {
+    match crate::update::build_number() {
+        Some(b) => format!("{VERSION} B{b}"),
+        None => VERSION.to_string(),
     }
-    resp
-}
-
-/// Key with an icon then a label, sized to fit. Returns (response, width).
-fn label_key(ui: &mut Ui, x_right: Option<f32>, x_left: f32, y: f32, h: f32, id: Id, kind: KeyKind, label: &str, icon: fn(&egui::Painter, Pos2, f32, Color32)) -> (Response, Rect) {
-    let font = bold(12.0);
-    let w = 14.0 + 14.0 + 5.0 + text_w(ui, label, font.clone()) + 14.0;
-    let rect = match x_right {
-        Some(xr) => Rect::from_min_size(Pos2::new(xr - w, y), Vec2::new(w, h)),
-        None => Rect::from_min_size(Pos2::new(x_left, y), Vec2::new(w, h)),
-    };
-    let label = label.to_string();
-    let resp = key(ui, rect, id, kind, R_SM, true, |p, r, col| {
-        icon(p, Pos2::new(r.left() + 14.0 + 7.0, r.center().y), 14.0, col);
-        p.text(Pos2::new(r.left() + 14.0 + 14.0 + 5.0, r.center().y), Align2::LEFT_CENTER, label, font, col);
-    });
-    (resp, rect)
 }
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 1.0]
+        self.th.paper.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
@@ -196,429 +391,490 @@ impl eframe::App for App {
 
         let (cards, folders, running_count, git_label, update) = self.snapshot(now);
         let mut actions: Vec<Action> = vec![];
-        let focused = ctx.input(|i| i.focused);
+        let th = self.th;
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(BOARD)).show(ctx, |ui| {
-            let full = ui.max_rect();
-            paint_board(ui.painter(), full);
-            let col_w = (full.width().min(MAX_W) - 2.0 * PAD_X).max(200.0);
-            let x0 = full.center().x - col_w / 2.0;
-            let x1 = x0 + col_w;
-            let mut y = full.top() + PAD_Y;
+        // WHETHER ESCAPE BELONGS TO THE FILTER IS READ BEFORE THE STRIP RUNS.
+        // The inline flows answer Escape themselves and clear their own state
+        // as they do it, so a gate read afterwards would already be open and
+        // one press would both cancel the rename and empty the filter.
+        let inline = self.edit.is_some() || self.del.is_some() || self.list || self.card_list;
 
-            // ── header ──
-            {
-                let p = ui.painter().clone();
-                let title = p.text(Pos2::new(x0, y + 17.0), Align2::LEFT_CENTER, "Targz Launchpad", bold(26.0), TEXT);
-                // The version badge doubles as "check for updates now".
-                let vtxt = if update.checking { "checking…".to_string() } else { match crate::update::build_number() { Some(b) => format!("v{VERSION} · build {b}"), None => format!("v{VERSION}") } };
-                let vw = text_w(ui, &vtxt, ui_font(11.0)) + 16.0;
-                let vr = Rect::from_min_size(Pos2::new(title.right() + 12.0, y + 10.0), Vec2::new(vw, 17.0));
-                let vresp = ui.interact(vr, Id::new("version"), Sense::click());
-                p.rect_filled(vr, 100.0, if vresp.hovered() { hex(0x34373d) } else { hex(0x2e3137) });
-                p.text(vr.center(), Align2::CENTER_CENTER, vtxt, ui_font(11.0), if vresp.hovered() { LED } else { TEXT_3 });
-                if vresp.hovered() {
-                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                let tip = if update.message.is_empty() { "Check for updates".to_string() } else { format!("{} — click to check again", update.message) };
-                if vresp.on_hover_text(tip).clicked() && !update.checking && !update.busy {
-                    actions.push(Action::CheckUpdate);
-                }
-
-                let mut xr = x1;
-                if running_count > 0 {
-                    let (r, rect) = label_key(ui, Some(xr), 0.0, y + 2.0, 32.0, Id::new("stopall"), KeyKind::Stop, "Stop All", icon_power);
-                    if r.clicked() {
-                        actions.push(Action::StopAll);
-                    }
-                    xr = rect.left() - 10.0;
-                }
-                let (r, rect) = label_key(ui, Some(xr), 0.0, y + 2.0, 32.0, Id::new("refresh"), KeyKind::Metal, "Refresh", icon_restart);
-                if r.on_hover_text("Rescan projects").clicked() {
-                    actions.push(Action::Refresh);
-                }
-                xr = rect.left() - 10.0;
-                if update.behind > 0 || update.busy {
-                    let label = if update.busy { update.message.clone() } else { "Install update".to_string() };
-                    let (r, _) = label_key(ui, Some(xr), 0.0, y + 2.0, 32.0, Id::new("update"), KeyKind::Primary, &label, icon_download);
-                    if r.on_hover_text(&update.message).clicked() && !update.busy {
-                        actions.push(Action::Update);
-                    }
-                }
-                y += 40.0;
-                let sub = ui.painter().text(Pos2::new(x0, y), Align2::LEFT_TOP, &git_label, ui_font(13.0), TEXT_3);
-                if !update.message.is_empty() {
-                    let resp = ui.interact(sub, Id::new("sub"), Sense::hover());
-                    resp.on_hover_text(&update.message);
-                }
-                y += 13.0 + 24.0 + 4.0;
-            }
-
-            // ── toolbar: filter, folder chips, counts ──
-            let in_folder: Vec<&Card> = cards.iter().filter(|c| self.folder.as_ref().map_or(true, |f| c.folders.contains(f))).collect();
-            let shown: Vec<&Card> = in_folder.iter().copied().filter(|c| self.matches(c)).collect();
-            {
-                let row = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + 34.0));
-                self.toolbar(ui, row, &folders, cards.len(), running_count, shown.len(), in_folder.len(), &mut actions);
-                y += 34.0 + 12.0;
-                ui.painter().line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0, hex(0x232529)));
-                y += 20.0;
-            }
-
-            // ── the rack ──
-            let grid_rect = Rect::from_min_max(Pos2::new(full.left(), y), full.max);
-            ui.allocate_new_ui(UiBuilder::new().max_rect(grid_rect), |ui| {
-                egui::ScrollArea::vertical().id_salt("rack").auto_shrink([false, false]).show(ui, |ui| {
-                    let top = ui.cursor().top();
-                    if shown.is_empty() {
-                        let msg = if !self.search.trim().is_empty() {
-                            format!("No projects match \"{}\"{}.", self.search.trim(), self.folder.as_ref().map(|f| format!(" in {f}")).unwrap_or_default())
-                        } else if let Some(f) = &self.folder {
-                            format!("\"{f}\" is empty. Drag a project card onto the folder chip to add it.")
-                        } else {
-                            "No projects found.".to_string()
-                        };
-                        let r = Rect::from_min_size(Pos2::new(x0, top), Vec2::new(col_w, 120.0));
-                        ui.allocate_rect(Rect::from_min_size(Pos2::new(full.left(), top), Vec2::new(full.width(), 120.0 + PAD_Y)), Sense::hover());
-                        well(ui.painter(), r, R_CARD, BAY);
-                        ui.painter().text(r.center(), Align2::CENTER_CENTER, msg, ui_font(14.0), hex(0x4a4e56));
-                        return;
-                    }
-                    let cols = (((col_w + GAP) / (CARD_MIN_W + GAP)).floor() as usize).max(1);
-                    let cw = (col_w - GAP * (cols as f32 - 1.0)) / cols as f32;
-                    let rows = shown.len().div_ceil(cols);
-                    let total_h = rows as f32 * CARD_H + (rows as f32 - 1.0) * GAP + PAD_Y;
-                    ui.allocate_rect(Rect::from_min_size(Pos2::new(full.left(), top), Vec2::new(full.width(), total_h)), Sense::hover());
-                    for (i, c) in shown.iter().enumerate() {
-                        let (r, k) = (i / cols, i % cols);
-                        let rect = Rect::from_min_size(Pos2::new(x0 + k as f32 * (cw + GAP), top + r as f32 * (CARD_H + GAP)), Vec2::new(cw, CARD_H));
-                        if ui.is_rect_visible(rect.expand(12.0)) {
-                            card(ui, rect, c, now, focused, &mut actions);
-                        }
-                    }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(th.paper))
+            .show(ctx, |ui| {
+                page(ui.painter(), ui.max_rect());
+                egui::ScrollArea::vertical().id_salt("page").auto_shrink([false, false]).show(ui, |ui| {
+                    let col = (ui.available_width() - 2.0 * PAD).min(MAX_W - 2.0 * PAD).max(220.0);
+                    ui.vertical_centered(|ui| {
+                        ui.set_max_width(col);
+                        ui.add_space(PAD);
+                        self.window(ui, &cards, &folders, running_count, &git_label, &update, now, &mut actions);
+                        ui.add_space(PAD);
+                    });
                 });
             });
-        });
 
-        self.modal_ui(ctx, &mut actions);
         self.toast_ui(ctx, now);
-        self.drag_ghost(ctx);
 
-        // keyboard: "/" focuses the filter, Esc clears it
-        if self.modal.is_none() {
+        // keyboard: "/" focuses the filter, Esc clears it — but only when no
+        // inline flow is up and nothing else is taking the keys.
+        if !inline && !ctx.wants_keyboard_input() {
             let slash = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if t == "/")));
-            if slash && !ctx.memory(|m| m.has_focus(Id::new("search"))) {
+            if slash {
                 self.focus_search = true;
             }
-            if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                self.search.clear();
-                ctx.memory_mut(|m| m.surrender_focus(Id::new("search")));
+        }
+        if !inline && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.search.clear();
+            if let Some(id) = self.filter_id {
+                ctx.memory_mut(|m| m.surrender_focus(id));
             }
         }
 
-        let animate = cards.iter().any(|c| c.running || c.busy.is_some()) && focused;
-        ctx.request_repaint_after(Duration::from_millis(if animate { 33 } else { 500 }));
+        let live = cards.iter().any(|c| c.busy.is_some() || matches!(c.report, Some(Report::Run(_))))
+            || matches!(self.ver, VerState::Checking | VerState::Updating(_))
+            || update.busy
+            || update.checking;
+        ctx.request_repaint_after(Duration::from_millis(if live { 33 } else { 500 }));
         self.run(ctx, actions);
     }
 }
 
 impl App {
+    /// The whole launcher: the strip, the running switch, then the rack, all
+    /// of it standing on the console's own ruled desk.
     #[allow(clippy::too_many_arguments)]
-    fn toolbar(&mut self, ui: &mut Ui, row: Rect, folders: &[(String, usize)], all: usize, running: usize, shown: usize, total: usize, actions: &mut Vec<Action>) {
-        let ctx = ui.ctx().clone();
-        let p = ui.painter().clone();
-        let cy = row.center().y;
+    fn window(
+        &mut self,
+        ui: &mut Ui,
+        cards: &[Card],
+        folders: &[String],
+        running: usize,
+        git_label: &str,
+        update: &UpdateState,
+        now: f64,
+        actions: &mut Vec<Action>,
+    ) {
+        let th = self.th;
+        console(ui, &th, 18.0, |ui| {
+            ui.set_width(ui.available_width());
+            self.strip(ui, cards, running, git_label, update, now, actions);
+            // TEN UNDER ROW ONE, because the switch belongs to it: a folder, a
+            // field and then only-what-is-running are three narrowings of one
+            // list, and a bigger break would cut the third off from the two it
+            // follows.
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 9.0;
+                pipe(ui, &th, self.only_up);
+                let mut on = self.only_up;
+                if slide(ui, &th, "lp-running", &mut on, SlideKind::Grip).clicked() {
+                    self.only_up = on;
+                }
+                ui.label(mono("RUNNING", 9.5).color(if self.only_up { th.ink } else { th.ink_2 }));
+            });
+            self.folder_plate(ui, folders);
+            // THIRTY-TWO UNDER THE WHOLE STRIP: the break between the window's
+            // chrome and its contents. It is the only gap here bigger than the
+            // 14 between two cards, because a band of controls one card-gap
+            // above the rack reads as the rack's first row.
+            ui.add_space(32.0);
+            self.rack(ui, cards, folders, actions);
+        });
+    }
 
-        // search well — grows on focus
-        let has_focus = ctx.memory(|m| m.has_focus(Id::new("search")));
-        let sw = ctx.animate_value_with_time(Id::new("search_w"), if has_focus { 300.0 } else { 200.0 }, 0.2);
-        let srect = Rect::from_min_size(Pos2::new(row.left(), cy - 15.0), Vec2::new(sw, 30.0));
-        if has_focus {
-            p.rect_stroke(srect.expand(1.5), 100.0, Stroke::new(3.0, rgba(255, 106, 0, 0.2)));
-        }
-        well(&p, srect, 15.0, BAY);
-        icon_search(&p, Pos2::new(srect.left() + 18.0, cy), 14.0, if has_focus { LED } else { hex(0x5b6069) });
-        let placeholder = match &self.folder {
-            None => "Filter all projects…".to_string(),
-            Some(f) => format!("Filter in {f}…"),
-        };
-        let edit_rect = Rect::from_min_max(Pos2::new(srect.left() + 31.0, cy - 9.0), Pos2::new(srect.right() - 28.0, cy + 9.0));
-        let resp = ui.put(
-            edit_rect,
-            egui::TextEdit::singleline(&mut self.search)
-                .id(Id::new("search"))
-                .frame(false)
-                .margin(Vec2::ZERO)
-                .font(ui_font(12.5))
-                .text_color(TEAL)
-                .hint_text(RichText::new(placeholder).color(hex(0x3f444c)).font(ui_font(12.5))),
-        );
-        if self.focus_search {
-            resp.request_focus();
-            self.focus_search = false;
-        }
-        if !self.search.is_empty() {
-            let xr = Rect::from_center_size(Pos2::new(srect.right() - 15.0, cy), Vec2::splat(18.0));
-            let r = ui.interact(xr, Id::new("search_clear"), Sense::click());
-            icon_x(&p, xr.center(), 13.0, if r.hovered() { TEXT } else { TEXT_3 });
-            if r.on_hover_text("Clear filter").clicked() {
-                self.search.clear();
-            }
-        }
-
-        // meta on the right: running pill, count, "/" hint
-        let mut xr = row.right();
-        let kbd = Rect::from_min_size(Pos2::new(xr - 18.0, cy - 9.0), Vec2::new(18.0, 18.0));
-        if self.search.is_empty() && !has_focus {
-            p.rect_filled(kbd, 5.0, rgba(0, 0, 0, 0.45));
-            p.rect_stroke(kbd, 5.0, Stroke::new(1.0, hex(0x2e3137)));
-            p.text(kbd.center(), Align2::CENTER_CENTER, "/", bold(10.0), TEXT_3);
-        }
-        xr = kbd.left() - 10.0;
-        let count = if shown == total { format!("{total} project{}", if total == 1 { "" } else { "s" }) } else { format!("{shown} of {total}") };
-        let cr = p.text(Pos2::new(xr, cy), Align2::RIGHT_CENTER, count, ui_font(11.5), TEXT_3);
-        xr = cr.left() - 10.0;
-        if running > 0 {
-            let label = format!("{running} running");
-            let w = text_w(ui, &label, bold(11.0)) + 9.0 + 5.0 + 5.0 + 9.0;
-            let pr = Rect::from_min_size(Pos2::new(xr - w, cy - 10.0), Vec2::new(w, 20.0));
-            p.rect_filled(pr, 100.0, rgba(0, 0, 0, 0.45));
-            let pulse = if ctx.input(|i| i.focused) { (((ctx.input(|i| i.time) * std::f64::consts::PI).sin() * 0.5 + 0.5) as f32) * 0.6 + 0.4 } else { 1.0 };
-            p.circle_filled(Pos2::new(pr.left() + 11.5, cy), 2.5, fade(TEAL_2, pulse));
-            p.text(Pos2::new(pr.left() + 19.0, cy), Align2::LEFT_CENTER, label, bold(11.0), TEAL);
-            xr = pr.left() - 10.0;
-        }
-
-        // folder chips, scrolling sideways when they do not fit
-        let bar = Rect::from_min_max(Pos2::new(srect.right() + 14.0, row.top()), Pos2::new(xr - 4.0, row.bottom()));
-        if bar.width() < 40.0 {
-            return;
-        }
-        let dragging = DragAndDrop::payload::<String>(&ctx);
-        let released = ctx.input(|i| i.pointer.any_released());
-        let pointer = ctx.input(|i| i.pointer.interact_pos());
-        let mut entries: Vec<(Option<String>, String, usize)> = vec![(None, "All".into(), all)];
-        entries.extend(folders.iter().map(|(f, n)| (Some(f.clone()), f.clone(), *n)));
-        ui.allocate_new_ui(UiBuilder::new().max_rect(bar), |ui| {
-            egui::ScrollArea::horizontal().id_salt("chips").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    for (folder, label, n) in &entries {
-                        let active = &self.folder == folder;
-                        let count = n.to_string();
-                        let cw = text_w(ui, &count, bold(10.0)) + 12.0;
-                        let edit_w = if active && folder.is_some() { 16.0 } else { 0.0 };
-                        let w = 14.0 + text_w(ui, label, ui_font(12.5)) + 6.0 + cw + edit_w + 14.0;
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
-                        let p = ui.painter();
-                        let droppable = dragging.is_some() && folder.is_some();
-                        let over = droppable && pointer.is_some_and(|q| rect.contains(q));
-                        if over {
-                            shadow(p, rect, 100.0, Vec2::new(0.0, 2.0), 10.0, 0.0, rgba(255, 106, 0, 0.35));
-                            p.rect_filled(rect.expand(1.0), 100.0, LED);
-                        } else {
-                            paint_key(p, rect, 100.0, &key_look(KeyKind::Metal, resp.hovered()), false);
-                            if droppable {
-                                p.rect_stroke(rect, 100.0, Stroke::new(1.0, LED));
-                            }
+    /// ══ ROW ONE: A LINE OF BOXES ════════════════════════════════════════
+    /// Everything cut as a box of one height — the selector, the field, the
+    /// keys — reading left to right as a sentence: which folder, then what
+    /// matches, then, past the channel, what the program is.
+    ///
+    /// IT IS LAID FROM THE RIGHT, and that is not a preference. The app group
+    /// is all fixed widths and the field is the only part that gives, so
+    /// taking the program's corner out of the row first leaves exactly the
+    /// room the field is allowed to claim.
+    #[allow(clippy::too_many_arguments)]
+    fn strip(
+        &mut self,
+        ui: &mut Ui,
+        cards: &[Card],
+        running: usize,
+        git_label: &str,
+        update: &UpdateState,
+        now: f64,
+        actions: &mut Vec<Action>,
+    ) {
+        let th = self.th;
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // ── what the program IS, right of the channel
+                let ver = self.ver_state(update, now);
+                self.ver = ver.clone();
+                if version_readout_h(ui, &th, &ver, CAP).clicked() {
+                    match ver {
+                        VerState::Available(_) => actions.push(Action::Update),
+                        VerState::Idle(_) | VerState::Latest | VerState::Failed | VerState::Done(_) => {
+                            actions.push(Action::CheckUpdate)
                         }
-                        let col = if over {
-                            hex(0x0b0b0d)
-                        } else if active {
-                            LED
-                        } else if resp.hovered() {
-                            hex(0xdfe2e7)
-                        } else {
-                            hex(0x8d929b)
-                        };
-                        let tr = p.text(Pos2::new(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, label, ui_font(12.5), col);
-                        if active && !over {
-                            shadow(p, tr, 3.0, Vec2::ZERO, 8.0, 0.0, rgba(255, 130, 30, 0.12));
-                        }
-                        let cr = Rect::from_min_size(Pos2::new(tr.right() + 6.0, rect.center().y - 8.0), Vec2::new(cw, 16.0));
-                        p.rect_filled(cr, 100.0, rgba(0, 0, 0, 0.45));
-                        p.text(cr.center(), Align2::CENTER_CENTER, count, bold(10.0), if active { hex(0xFFD9BC) } else { TEAL });
-                        let mut edit_hit = false;
-                        if edit_w > 0.0 {
-                            let er = Rect::from_center_size(Pos2::new(cr.right() + 10.0, rect.center().y), Vec2::splat(14.0));
-                            let hov = pointer.is_some_and(|q| er.contains(q));
-                            icon_pencil(p, er.center(), 12.0, fade(col, if hov { 1.0 } else { 0.45 }));
-                            edit_hit = hov;
-                        }
-                        if over && released {
-                            if let (Some(f), Some(name)) = (folder, DragAndDrop::take_payload::<String>(ui.ctx())) {
-                                actions.push(Action::Assign(f.clone(), (*name).clone(), true));
-                            }
-                        }
-                        if resp.clicked() {
-                            if edit_hit {
-                                if let Some(f) = folder {
-                                    actions.push(Action::EditFolder(f.clone()));
-                                }
-                            } else {
-                                self.folder = folder.clone();
-                            }
-                        }
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
+                        _ => {}
                     }
-                    // "+ New folder": an outline, not a key
-                    let label = "+ New folder";
-                    let w = 28.0 + text_w(ui, label, ui_font(12.5));
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
-                    let p = ui.painter();
-                    p.rect_stroke(rect.shrink(0.5), 100.0, Stroke::new(1.0, rgba(255, 255, 255, if resp.hovered() { 0.18 } else { 0.09 })));
-                    p.text(rect.center(), Align2::CENTER_CENTER, label, ui_font(12.5), if resp.hovered() { hex(0xc6cad1) } else { hex(0x6d727c) });
-                    if resp.clicked() {
-                        actions.push(Action::NewFolder);
+                }
+                // THE PERCENTAGE IS A GUESS AND THE WORDS ARE THE REPORT, so
+                // the words stay on the strip: a check that failed has a
+                // reason, and the readout only has room to say that it did.
+                if (update.failed || update.busy) && !update.message.is_empty() {
+                    ui.label(mono(&update.message, 9.0).color(if update.failed { th.no_ink } else { th.ink_3 }));
+                }
+                channel(ui, &th);
+                // ── and what you do to the whole rack
+                if running > 0
+                    && act(
+                        ui,
+                        &th,
+                        &[Part::Lens(Lens::Stop), Part::Text("STOP ALL"), Part::Count(running)],
+                        ActStyle::Aux,
+                        CAP,
+                        true,
+                    )
+                    .on_hover_text("Stop every running server")
+                    .clicked()
+                {
+                    actions.push(Action::StopAll);
+                }
+                // THE GIT DIRECTORY RIDES ON RESCAN. It is the answer to "look
+                // for projects WHERE", so it belongs on the key that looks.
+                if act(ui, &th, &[Part::Icon(Icon::Restart), Part::Text("RESCAN")], ActStyle::Aux, CAP, true)
+                    .on_hover_text(format!("Look for projects again — {git_label}"))
+                    .clicked()
+                {
+                    actions.push(Action::Refresh);
+                }
+                ui.add_space(10.0);
+
+                // ── and your projects, in the room that is left
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if let Some(name) = self.del.clone() {
+                        self.armed_row(ui, cards, &name);
+                    } else if let Some(mode) = self.edit {
+                        self.edit_row(ui, mode);
+                    } else {
+                        self.resting_row(ui);
                     }
                 });
             });
         });
     }
 
-    fn modal_ui(&mut self, ctx: &Context, actions: &mut Vec<Action>) {
-        let Some(m) = self.modal.as_mut() else { return };
-        let screen = ctx.screen_rect();
-        let mut close = false;
-        let mut confirm = false;
-        let mut delete = false;
-        egui::Area::new(Id::new("modal_bg")).order(Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
-            let r = ui.allocate_rect(screen, Sense::click());
-            ui.painter().rect_filled(screen, 0.0, rgba(0, 0, 0, 0.55));
-            if r.clicked() {
-                close = true;
+    /// THE WHOLE ROW, not a group in it: the sentence needs the width the
+    /// selector and the field were using, and leaving them there would let you
+    /// change the folder you are deleting while the warning for the old one is
+    /// still up.
+    fn armed_row(&mut self, ui: &mut Ui, cards: &[Card], name: &str) {
+        let th = self.th;
+        let n = cards.iter().filter(|p| p.folders.iter().any(|f| f == name)).count();
+        let tail = if n > 0 {
+            format!(
+                " — {n} project{} go back to no folder. Nothing on disk is touched.",
+                if n == 1 { "" } else { "s" }
+            )
+        } else {
+            " — it is empty. Nothing on disk is touched.".to_string()
+        };
+        con_say(ui, &th, "Delete ", name, &tail);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if act(ui, &th, &[Part::Icon(Icon::Trash), Part::Text("DELETE")], ActStyle::Halt, CAP, true).clicked() {
+                self.do_delete();
+            }
+            if act(ui, &th, &[Part::Text("CANCEL")], ActStyle::Aux, CAP, true).clicked() {
+                self.del = None;
             }
         });
-        let w = 420.0f32.min(screen.width() - 40.0);
-        let h = 236.0;
-        let rect = Rect::from_center_size(screen.center(), Vec2::new(w, h));
-        egui::Area::new(Id::new("modal")).order(Order::Tooltip).fixed_pos(rect.min).show(ctx, |ui| {
-            ui.allocate_rect(rect, Sense::click());
-            let p = ui.painter().clone();
-            shadow(&p, rect, R_CARD, Vec2::new(0.0, 16.0), 48.0, 0.0, rgba(0, 0, 0, 0.5));
-            p.rect_filled(rect, R_CARD, hex(0x17181b));
-            rim(&p, rect, R_CARD, rgba(255, 255, 255, 0.08));
-            let x = rect.left() + 24.0;
-            let mut y = rect.top() + 24.0;
-            let (title, hint, ok) = match &m.mode {
-                ModalMode::New => ("New folder", "Group projects you use together. Drag a card's grip onto the folder to add it.", "Create"),
-                ModalMode::Edit(_) => ("Edit folder", "Rename it, or delete the folder. Projects themselves are never touched.", "Save"),
-            };
-            p.text(Pos2::new(x, y), Align2::LEFT_TOP, title, bold(16.0), TEXT);
-            y += 26.0;
-            let mut job = LayoutJob::single_section(hint.to_string(), TextFormat { font_id: ui_font(12.5), color: TEXT_2, ..Default::default() });
-            job.wrap.max_width = w - 48.0;
-            let g = p.layout_job(job);
-            let gh = g.size().y;
-            p.galley(Pos2::new(x, y), g, TEXT_2);
-            y += gh + 16.0;
-            p.text(Pos2::new(x, y), Align2::LEFT_TOP, "NAME", bold(11.0), TEXT_3);
-            y += 18.0;
-            let field = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w - 48.0, 38.0));
-            well(&p, field, R_SM, BAY);
-            let resp = ui.put(
-                field.shrink2(Vec2::new(12.0, 10.0)),
-                egui::TextEdit::singleline(&mut m.text).id(Id::new("modal_text")).frame(false).margin(Vec2::ZERO).font(ui_font(14.0)).text_color(TEAL),
-            );
-            if !m.focused {
-                resp.request_focus();
-                m.focused = true;
-            }
-            if resp.has_focus() {
-                p.rect_stroke(field.expand(1.5), R_SM + 1.5, Stroke::new(3.0, rgba(255, 106, 0, 0.2)));
-            }
-            y += 38.0 + 8.0;
-            if !m.error.is_empty() {
-                p.text(Pos2::new(x, y), Align2::LEFT_TOP, &m.error, ui_font(12.0), hex(0xFF9B9B));
-            }
-            let by = rect.bottom() - 24.0 - 36.0;
-            let (r_ok, ok_rect) = label_key_plain(ui, Some(rect.right() - 24.0), by, Id::new("m_ok"), KeyKind::Primary, ok);
-            let (r_cancel, _) = label_key_plain(ui, Some(ok_rect.left() - 8.0), by, Id::new("m_cancel"), KeyKind::Metal, "Cancel");
-            if matches!(m.mode, ModalMode::Edit(_)) {
-                let (r_del, _) = label_key_plain(ui, None, by, Id::new("m_del"), KeyKind::Danger, "Delete folder");
-                if r_del.clicked() {
-                    delete = true;
-                }
-                let _ = x;
-            }
-            if r_ok.clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                confirm = true;
-            }
-            if r_cancel.clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                close = true;
-            }
-        });
-        let _ = actions;
-        if delete {
-            if let ModalMode::Edit(name) = &m.mode {
-                let name = name.clone();
-                self.shared.lock().unwrap().cfg.delete_folder(&name);
-                if self.folder.as_deref() == Some(name.as_str()) {
-                    self.folder = None;
-                }
-            }
-            self.modal = None;
-            return;
-        }
-        if confirm {
-            let res = {
-                let mut c = self.shared.lock().unwrap();
-                match &m.mode {
-                    ModalMode::New => c.cfg.create_folder(&m.text),
-                    ModalMode::Edit(from) => c.cfg.rename_folder(from, &m.text),
-                }
-            };
-            match res {
-                Ok(()) => {
-                    let name = m.text.trim().to_string();
-                    if let ModalMode::Edit(from) = &m.mode {
-                        if self.folder.as_deref() == Some(from.as_str()) {
-                            self.folder = Some(name);
-                        }
-                    } else {
-                        self.folder = Some(name);
-                    }
-                    self.modal = None;
-                }
-                Err(e) => m.error = e,
-            }
-            return;
-        }
-        if close {
-            self.modal = None;
+        // ESCAPE LEAVES, which is what every other field here already does —
+        // and the armed row is the one place a stray Return could empty a
+        // folder, so nothing in it is focused by default.
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.del = None;
         }
     }
 
+    /// THE SELECTOR BECOMES THE FIELD. Same place, same 186px, same row: the
+    /// control that SHOWS the name is the control that TAKES it, which is how
+    /// a file is renamed in every file browser there has ever been.
+    fn edit_row(&mut self, ui: &mut Ui, mode: Edit) {
+        let th = self.th;
+        // THE BIN IS ON THE FAR SIDE OF THE FIELD FROM THE TICK. They are the
+        // two ways out and they do opposite things; side by side they are a
+        // pair of caps differing only by the mark on the face, and the one you
+        // hit by mistake empties a folder. A folder being named for the first
+        // time does not exist yet, so there is nothing to bin.
+        let bin = (mode == Edit::Rename).then(|| {
+            act(ui, &th, &[Part::Icon(Icon::Trash)], ActStyle::Aux, CAP, true).on_hover_text("Delete this folder")
+        });
+        let hint = if mode == Edit::New { "NEW FOLDER" } else { "FOLDER NAME" };
+        let f = slot_field(ui, &th, 186.0, CAP, None, hint, &mut self.buf);
+        if self.focus_buf {
+            f.request_focus();
+            self.focus_buf = false;
+        }
+        let ok = act(ui, &th, &[Part::Icon(Icon::Check)], ActStyle::Go, CAP, true).on_hover_text("Save this name");
+
+        // THE ORDER THESE ARE RESOLVED IN IS THE WHOLE CORRECTNESS OF THE ROW.
+        // ESCAPE FIRST: a `TextEdit` also loses focus on Escape, so a commit
+        // keyed off `lost_focus` would save the name you just cancelled.
+        // THE BIN NEXT: the press that arms it is the press that blurs the
+        // field, so arming has to happen before the blur is read as a commit —
+        // otherwise the bin arrives to delete a folder that has just been
+        // renamed out from under it.
+        let esc = ui.input(|i| i.key_pressed(Key::Escape));
+        let binning = bin.as_ref().is_some_and(|b| b.clicked() || b.is_pointer_button_down_on());
+        if esc {
+            self.edit = None;
+        } else if binning {
+            // `was` is the folder as it stands, never the half-typed name:
+            // that is the only thing there is to remove.
+            self.del = Some(self.folder.clone());
+            self.edit = None;
+        } else if ok.clicked() || (f.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+            self.commit();
+        }
+    }
+
+    /// THE VALUE LEADS AND ITS COMMAND FOLLOWS IT. The selector says which
+    /// folder; the pencil acts on THAT folder, so it comes after it and
+    /// vanishes with it. First would be a verb with no object for as long as
+    /// ALL FOLDERS is up.
+    fn resting_row(&mut self, ui: &mut Ui) {
+        let th = self.th;
+        let cur = self.folder.clone();
+        let sr = sel(ui, &th, &cur, 186.0, CAP, self.list);
+        self.sel_rect = sr.rect;
+        if sr.on_hover_text("Which projects").clicked() {
+            self.list = !self.list;
+        }
+        if self.named()
+            && act(ui, &th, &[Part::Icon(Icon::Pencil)], ActStyle::Aux, CAP, true)
+                .on_hover_text("Rename or delete this folder")
+                .clicked()
+        {
+            self.edit = Some(Edit::Rename);
+            self.buf = cur;
+            self.focus_buf = true;
+        }
+        ui.add_space(10.0);
+        // THE FIELD IS THE ONLY THING THAT GIVES, and it never gives
+        // everything: at 200 the placeholder still reads, and a field narrower
+        // than its own label cannot be told from a button.
+        let w = ui.available_width().clamp(200.0, 420.0);
+        let f = ui.push_id("lp-filter", |ui| slot_field(ui, &th, w, CAP, Some(Icon::Search), "FILTER", &mut self.search)).inner;
+        self.filter_id = Some(f.id);
+        if self.focus_search {
+            f.request_focus();
+            self.focus_search = false;
+        }
+    }
+
+    /// THE OPEN LIST, IN AN OVERLAY AND NOT IN THE ROW. A plate that takes
+    /// layout space is not a plate: laid out in the strip it pushed the rack
+    /// half a window down every time the list opened, which is the one thing a
+    /// popover exists to avoid.
+    ///
+    /// IT CLOSES THE WAY EVERY PLATE IN THIS SYSTEM CLOSES: the face, Escape,
+    /// or a press anywhere else. Not the chevron, which lies down and stays
+    /// down because it is a signpost.
+    fn folder_plate(&mut self, ui: &mut Ui, folders: &[String]) {
+        if !self.list {
+            return;
+        }
+        let th = self.th;
+        let opts = self.opts(folders);
+        let refs: Vec<&str> = opts.iter().map(|s| s.as_str()).collect();
+        let cur = refs.iter().position(|v| *v == self.folder).unwrap_or(0);
+        let at = pos2(self.sel_rect.left(), self.sel_rect.bottom() + 6.0);
+        let picked = egui::Area::new(Id::new("lp-sellist"))
+            .order(Order::Foreground)
+            .fixed_pos(at)
+            .show(ui.ctx(), |ui| sel_list(ui, &th, 186.0, &refs, cur, &["NEW FOLDER…"]))
+            .inner;
+        let plate = Rect::from_min_size(at, sel_list_size(refs.len(), 1, 186.0));
+        if let Some(i) = picked {
+            self.list = false;
+            if i < opts.len() {
+                self.folder = opts[i].clone();
+            } else {
+                // NEW NEEDS NOTHING, so it lives in the list — that is where
+                // you already are when you are thinking about folders, and the
+                // only place the answer could be.
+                self.edit = Some(Edit::New);
+                self.buf.clear();
+                self.focus_buf = true;
+            }
+        } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.list = false;
+        } else if ui.ctx().input(|i| i.pointer.any_click()) {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                if !plate.contains(pos) && !self.sel_rect.contains(pos) {
+                    self.list = false;
+                }
+            }
+        }
+    }
+
+    /// ══ THE RACK ════════════════════════════════════════════════════════
+    fn rack(&mut self, ui: &mut Ui, cards: &[Card], folders: &[String], actions: &mut Vec<Action>) {
+        let th = self.th;
+        let shown: Vec<&Card> = cards.iter().filter(|c| self.in_filter(c)).filter(|c| self.matches(c)).collect();
+        if shown.is_empty() {
+            let (txt, out) = if self.filtering() {
+                ("NOTHING MATCHES", Some("CLEAR FILTERS"))
+            } else {
+                ("NO PROJECTS FOUND", None)
+            };
+            if let Some(r) = empty_rack(ui, &th, txt, out) {
+                if r.clicked() {
+                    self.search.clear();
+                    self.folder = ALL.to_string();
+                    self.only_up = false;
+                }
+            }
+            return;
+        }
+        let open = self.card.clone();
+        let cols = ((ui.available_width() + GAP) / (MODULE_MIN_W + GAP)).floor().max(1.0) as usize;
+        let mut hits: Vec<(String, ModuleHit)> = Vec::new();
+        let mut open_rect = None;
+        for row in shown.chunks(cols) {
+            ui.columns(cols, |c| {
+                for (k, card) in row.iter().enumerate() {
+                    // THE FOLDER IS THE STAMP AND THE REST ARE TAGS. Core lets
+                    // a project sit in several folders; the card names the one
+                    // it leads with and carries the others beside it, so
+                    // nothing the config holds goes missing off the face.
+                    let tags: Vec<&str> = card.folders.iter().skip(1).map(String::as_str).collect();
+                    let line = card.line();
+                    let v = ModuleView {
+                        name: &card.name,
+                        port: card.port.unwrap_or(0),
+                        up: card.running,
+                        folder: card.folder(),
+                        tags: &tags,
+                        pull: line.as_ref(),
+                        editing: open.as_deref() == Some(card.name.as_str()),
+                    };
+                    let out = c[k].scope(|ui| module_card(ui, &th, &v));
+                    if open.as_deref() == Some(card.name.as_str()) {
+                        open_rect = Some(out.response.rect);
+                    }
+                    if let Some(h) = out.inner {
+                        hits.push((card.name.clone(), h));
+                    }
+                }
+            });
+            ui.add_space(GAP);
+        }
+        if let Some(r) = open_rect {
+            self.card_rect = r;
+        }
+        for (name, h) in hits {
+            let Some(card) = cards.iter().find(|c| c.name == name) else { continue };
+            match h {
+                // THE DRAWER SURVIVES THE RACK BEING REDRAWN UNDER IT: filing
+                // a project repaints everything, and a drawer that shut every
+                // time you used it is one you open twice.
+                ModuleHit::Edit => {
+                    self.card = if self.card.as_deref() == Some(name.as_str()) { None } else { Some(name.clone()) };
+                    self.card_list = false;
+                }
+                ModuleHit::Drawer => self.card_list = !self.card_list,
+                ModuleHit::Stop => actions.push(Action::Stop(name)),
+                ModuleHit::Restart => actions.push(Action::Restart(name)),
+                ModuleHit::Launch => actions.push(Action::Launch(name)),
+                ModuleHit::Open => actions.push(Action::OpenUrl(card.port.unwrap_or(0))),
+                ModuleHit::Editor => actions.push(Action::Editor(card.path.clone())),
+                ModuleHit::Finder => actions.push(Action::Finder(card.path.clone())),
+                ModuleHit::Terminal => actions.push(Action::Terminal(card.path.clone())),
+                ModuleHit::Pull => actions.push(Action::Pull(name, card.path.clone())),
+                // RETRY answers whatever failed: the launcher or the pull
+                ModuleHit::Pull2(PullHit::Retry) => actions.push(match &card.report {
+                    Some(Report::Fail(_)) if card.running => Action::Restart(name),
+                    Some(Report::Fail(_)) => Action::Launch(name),
+                    _ => Action::Pull(name, card.path.clone()),
+                }),
+                ModuleHit::Pull2(PullHit::Terminal) => actions.push(Action::Terminal(card.path.clone())),
+                ModuleHit::Pull2(PullHit::Dismiss) => actions.push(Action::Dismiss(name)),
+            }
+        }
+        self.drawer_plate(ui, cards, folders, actions);
+    }
+
+    /// The drawer's own plate. It hangs off the CARD and not off the selector
+    /// inside it: `module_card` draws that selector itself and returns a hit,
+    /// not a rect, and the card is the thing that stays put while the rack
+    /// scrolls under it.
+    fn drawer_plate(&mut self, ui: &mut Ui, cards: &[Card], folders: &[String], actions: &mut Vec<Action>) {
+        if !self.card_list {
+            return;
+        }
+        let Some(name) = self.card.clone() else { return };
+        let Some(card) = cards.iter().find(|c| c.name == name) else { return };
+        let th = self.th;
+        let mut opts = vec![NONE.to_string()];
+        opts.extend(folders.iter().cloned());
+        let refs: Vec<&str> = opts.iter().map(|s| s.as_str()).collect();
+        let cur = refs.iter().position(|v| *v == card.folder()).unwrap_or(0);
+        let at = pos2(self.card_rect.left() + 16.0, self.card_rect.bottom() + 6.0);
+        let picked = egui::Area::new(Id::new("lp-drawerlist"))
+            .order(Order::Foreground)
+            .fixed_pos(at)
+            .show(ui.ctx(), |ui| sel_list(ui, &th, 176.0, &refs, cur, &[]))
+            .inner;
+        let plate = Rect::from_min_size(at, sel_list_size(refs.len(), 0, 176.0));
+        if let Some(i) = picked {
+            self.card_list = false;
+            // ONE FOLDER, WRITTEN WHOLE. The drawer is a single selector, so
+            // what it commits is a single answer: the card leaves every folder
+            // it was in and joins the one that was picked.
+            let to = (i > 0).then(|| opts[i].clone());
+            actions.push(Action::SetFolder(name, to));
+        } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.card_list = false;
+        } else if ui.ctx().input(|i| i.pointer.any_click()) {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                // the whole card is excluded, because the press that opened
+                // this plate landed on the selector inside it
+                if !plate.contains(pos) && !self.card_rect.contains(pos) {
+                    self.card_list = false;
+                }
+            }
+        }
+    }
+
+    /// What has no slot on a card: an editor that would not open, a folder
+    /// name core refused.
     fn toast_ui(&mut self, ctx: &Context, now: f64) {
         let Some((msg, at)) = &self.toast else { return };
+        let th = self.th;
         let age = now - at;
-        if age > 2.8 {
+        if age > 3.2 {
             self.toast = None;
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(50));
-        let alpha = (age / 0.18).min(1.0).min((2.8 - age) / 0.18) as f32;
+        let alpha = (age / 0.18).min(1.0).min((3.2 - age) / 0.18) as f32;
         let p = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("toast")));
         let screen = ctx.screen_rect();
-        let w = p.layout_no_wrap(msg.clone(), ui_font(13.0), TEXT).size().x + 36.0;
-        let rect = Rect::from_center_size(Pos2::new(screen.center().x, screen.bottom() - 24.0 - 20.0 + 8.0 * (1.0 - alpha)), Vec2::new(w, 40.0));
-        shadow(&p, rect, 100.0, Vec2::new(0.0, 8.0), 24.0, 0.0, rgba(0, 0, 0, 0.4 * alpha));
-        p.rect_filled(rect, 100.0, fade(hex(0x2c2f34), alpha));
-        p.text(rect.center(), Align2::CENTER_CENTER, msg, ui_font(13.0), fade(TEXT, alpha));
-    }
-
-    fn drag_ghost(&self, ctx: &Context) {
-        let Some(name) = DragAndDrop::payload::<String>(ctx) else { return };
-        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return };
-        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        let p = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("ghost")));
-        let w = p.layout_no_wrap(name.to_string(), bold(12.5), TEXT).size().x + 24.0;
-        let rect = Rect::from_min_size(pos + Vec2::new(12.0, 8.0), Vec2::new(w, 28.0));
-        shadow(&p, rect, R_SM, Vec2::new(0.0, 5.0), 9.0, 0.0, rgba(0, 0, 0, 0.65));
-        p.rect_filled(rect, R_SM, CARD_LIT);
-        p.text(rect.center(), Align2::CENTER_CENTER, name.as_str(), bold(12.5), TEXT);
+        let font = egui::FontId::monospace(11.0);
+        let w = p.layout_no_wrap(msg.clone(), font.clone(), th.ink).size().x + 32.0;
+        let rect = Rect::from_center_size(
+            pos2(screen.center().x, screen.bottom() - 42.0 + 8.0 * (1.0 - alpha)),
+            vec2(w.min(screen.width() - 40.0), 36.0),
+        );
+        let mut p = p;
+        p.set_opacity(alpha);
+        p.rect_filled(rect, th.r_key, th.card);
+        p.rect_stroke(rect.shrink(0.5), th.r_key, Stroke::new(1.0, th.edge_ctl));
+        p.text(rect.center(), Align2::CENTER_CENTER, msg, font, th.ink);
     }
 
     fn run(&mut self, ctx: &Context, actions: Vec<Action>) {
@@ -628,12 +884,21 @@ impl App {
                 move || ctx.request_repaint()
             };
             match a {
-                Action::Launch(n) => core::start_async(&self.shared, n, repaint),
-                Action::Restart(n) => core::restart_async(&self.shared, n, repaint),
+                Action::Launch(n) => {
+                    self.shared.lock().unwrap().reports.remove(&n);
+                    core::start_async(&self.shared, n, repaint)
+                }
+                Action::Restart(n) => {
+                    self.shared.lock().unwrap().reports.remove(&n);
+                    core::restart_async(&self.shared, n, repaint)
+                }
                 Action::Stop(n) => self.shared.lock().unwrap().stop(&n),
                 Action::StopAll => self.shared.lock().unwrap().stop_all(),
                 Action::OpenUrl(port) => core::open_url(port),
                 Action::Finder(p) => core::open_finder(&p),
+                Action::Dismiss(n) => {
+                    self.shared.lock().unwrap().reports.remove(&n);
+                }
                 Action::Editor(p) => {
                     let mut c = self.shared.lock().unwrap();
                     if let Err(e) = core::open_editor(&c.cfg, &p) {
@@ -646,16 +911,10 @@ impl App {
                         c.toasts.push(format!("Terminal failed: {e}"));
                     }
                 }
-                Action::Pull(p) => {
+                Action::Pull(name, p) => {
                     let s = self.shared.clone();
-                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     std::thread::spawn(move || {
-                        let msg = match crate::update::pull(&p) {
-                            Ok(m) => format!("{name}: {m}"),
-                            Err(e) => format!("{name}: {e}"),
-                        };
-                        s.lock().unwrap().toasts.push(msg);
-                        repaint();
+                        crate::update::pull_reporting(&s, &name, &p, repaint);
                     });
                 }
                 Action::Refresh => {
@@ -677,307 +936,98 @@ impl App {
                     s.lock().unwrap().update.checking = true;
                     std::thread::spawn(move || {
                         crate::update::check(&s);
-                        let mut c = s.lock().unwrap();
-                        c.update.checking = false;
-                        let msg = c.update.message.clone();
-                        c.toasts.push(msg);
-                        drop(c);
+                        s.lock().unwrap().update.checking = false;
                         repaint();
                     });
                 }
-                Action::Assign(f, p, add) => self.shared.lock().unwrap().cfg.assign(&f, &p, add),
-                Action::NewFolder => self.modal = Some(Modal { mode: ModalMode::New, text: String::new(), error: String::new(), focused: false }),
-                Action::EditFolder(f) => self.modal = Some(Modal { mode: ModalMode::Edit(f.clone()), text: f, error: String::new(), focused: false }),
+                Action::SetFolder(project, to) => {
+                    let mut c = self.shared.lock().unwrap();
+                    let all = c.cfg.folders.clone();
+                    for f in &all {
+                        let keep = to.as_deref() == Some(f.as_str());
+                        c.cfg.assign(f, &project, keep);
+                    }
+                }
             }
         }
     }
 }
 
-fn ui_font(s: f32) -> egui::FontId {
-    crate::theme::ui(s)
-}
-
-/// Dialog key: label only.
-fn label_key_plain(ui: &mut Ui, x_right: Option<f32>, y: f32, id: Id, kind: KeyKind, label: &str) -> (Response, Rect) {
-    let font = bold(13.0);
-    let w = text_w(ui, label, font.clone()) + 32.0;
-    let x = match x_right {
-        Some(xr) => xr - w,
-        None => ui.max_rect().left() + 24.0,
-    };
-    let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, 36.0));
-    let label = label.to_string();
-    let r = key(ui, rect, id, kind, R_SM, true, |p, r, col| {
-        p.text(r.center(), Align2::CENTER_CENTER, label, font, col);
-    });
-    (r, rect)
-}
-
-/// The board: black, with a faint 120/24 px rule grid.
-fn paint_board(p: &egui::Painter, rect: Rect) {
-    p.rect_filled(rect, 0.0, BOARD);
-    let mut x = rect.left();
-    let mut i = 0;
-    while x < rect.right() {
-        let c = if i % 5 == 0 { rgba(255, 255, 255, 0.055) } else { rgba(255, 255, 255, 0.025) };
-        p.line_segment([Pos2::new(x + 23.5, rect.top()), Pos2::new(x + 23.5, rect.bottom())], Stroke::new(1.0, c));
-        x += 24.0;
-        i += 1;
+/// `.pipe` — the layer lamp at the head of a `.tog` row: 4px of lit colour,
+/// the height of the row, with its own small bloom. Unlit it is a milled bar.
+/// A round lamp between the switch and its name would be a third object in a
+/// part that has two.
+fn pipe(ui: &mut Ui, th: &Theme, on: bool) {
+    let (r, _) = ui.allocate_exact_size(vec2(4.0, 22.0), Sense::hover());
+    if !ui.is_rect_visible(r) {
+        return;
     }
-    let mut y = rect.top();
-    i = 0;
-    while y < rect.bottom() {
-        let c = if i % 5 == 4 { rgba(255, 255, 255, 0.055) } else { rgba(255, 255, 255, 0.025) };
-        p.line_segment([Pos2::new(rect.left(), y + 23.5), Pos2::new(rect.right(), y + 23.5)], Stroke::new(1.0, c));
-        y += 24.0;
-        i += 1;
-    }
-}
-
-fn elided(p: &egui::Painter, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = LayoutJob::single_section(text.to_string(), TextFormat { font_id: font, color, ..Default::default() });
-    job.wrap = TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    p.layout_job(job)
-}
-
-/// One project module on the rack.
-fn card(ui: &mut Ui, rect: Rect, c: &Card, t: f64, focused: bool, actions: &mut Vec<Action>) {
-    let ctx = ui.ctx().clone();
-    let id = Id::new(("card", &c.name));
-    let starting = c.busy == Some(Busy::Starting);
-    let restarting = c.busy == Some(Busy::Restarting);
-    let lit = c.running && !starting;
-    let hover = ui.rect_contains_pointer(rect);
-    let dragged_me = DragAndDrop::payload::<String>(&ctx).is_some_and(|n| *n == c.name);
-    let rect = if hover && !dragged_me { rect.translate(Vec2::new(0.0, -1.0)) } else { rect };
-    let p = ui.painter().clone();
-
-    // body
-    if lit {
-        shadow(&p, rect, R_CARD, Vec2::new(0.0, if hover { 5.0 } else { 3.0 }), if hover { 9.0 } else { 6.0 }, 0.0, rgba(0, 0, 0, 0.62));
-        p.rect_filled(rect, R_CARD, CARD_LIT);
-        rim(&p, rect, R_CARD, rgba(255, 255, 255, 0.11));
+    let p = ui.painter();
+    if on {
+        p.rect_filled(r.expand(3.0), egui::Rounding::same(5.0), th.primary.gamma_multiply(0.16));
+        p.rect_filled(r, egui::Rounding::same(2.0), th.primary);
     } else {
-        shadow(&p, rect, R_CARD, Vec2::new(0.0, if hover { 4.0 } else { 2.0 }), if hover { 8.0 } else { 4.0 }, 0.0, rgba(0, 0, 0, 0.5));
-        p.rect_filled(rect, R_CARD, CARD_OFF);
-        rim(&p, rect, R_CARD, rgba(255, 255, 255, 0.04));
-    }
-    // the running rail: a light pipe down the left edge, nothing when idle
-    if lit && !restarting {
-        let rail = Rect::from_min_size(rect.min, Vec2::new(10.0, rect.height()));
-        shadow(&p, rail, egui::Rounding { nw: R_CARD, sw: R_CARD, ne: 0.0, se: 0.0 }, Vec2::ZERO, 7.0, 0.0, rgba(45, 212, 191, 0.55));
-        vgrad(&p, rail, egui::Rounding { nw: R_CARD, sw: R_CARD, ne: 0.0, se: 0.0 }, &[(0.0, TEAL), (1.0, TEAL_2)]);
-        p.line_segment([Pos2::new(rail.right() - 3.5, rail.top() + 8.0), Pos2::new(rail.right() - 3.5, rail.bottom() - 8.0)], Stroke::new(1.0, rgba(255, 255, 255, 0.35)));
-    }
-
-    let x0 = rect.left() + 10.0 + 20.0;
-    let x1 = rect.right() - 20.0;
-    let y = rect.top() + 18.0;
-
-    // header: lamp + name
-    let pulse = if lit && focused { ((t * std::f64::consts::PI).sin() * 0.5 + 0.5) as f32 } else { 0.0 };
-    led(&p, Pos2::new(x0 + 4.0, y + 11.0), lit && !restarting, pulse);
-    let mut nx = x0 + 16.0;
-    if let Some(g) = &c.group {
-        let r = p.text(Pos2::new(nx, y + 11.0), Align2::LEFT_CENTER, format!("{g}/"), ui_font(15.0), TEXT_3);
-        nx = r.right();
-    }
-    let ng = elided(&p, &c.short, bold(15.0), TEXT, x1 - nx);
-    p.galley(Pos2::new(nx, y + 11.0 - ng.size().y / 2.0), ng, TEXT);
-
-    // description: one line, full text on hover
-    let dg = elided(&p, &c.desc, ui_font(12.5), TEXT_3, x1 - x0);
-    let drect = Rect::from_min_size(Pos2::new(x0, y + 28.0), Vec2::new(x1 - x0, 18.0));
-    p.galley(Pos2::new(x0, drect.center().y - dg.size().y / 2.0), dg, TEXT_3);
-    if !c.desc.is_empty() {
-        ui.interact(drect, id.with("desc"), Sense::hover()).on_hover_text(&c.desc);
-    }
-
-    // the port strip: a lit link when running, a sleeping slot when not
-    let ur = Rect::from_min_size(Pos2::new(x0, y + 60.0), Vec2::new(x1 - x0, 36.0));
-    if lit {
-        let resp = ui.interact(ur, id.with("url"), if restarting { Sense::hover() } else { Sense::click() });
-        let k = if restarting { 0.4 } else { 1.0 };
-        vgrad(&p, ur, R_SM, &[(0.0, hex(0x0b0b0d)), (1.0, hex(0x042F2E))]);
-        p.rect_stroke(ur.shrink(1.0), R_SM, Stroke::new(2.0, rgba(0, 0, 0, 0.5)));
-        let glow = if resp.hovered() { 0.2 } else { 0.1 };
-        p.rect_stroke(ur.shrink(3.0), R_SM - 2.0, Stroke::new(4.0, rgba(45, 212, 191, glow * 0.5)));
-        if resp.hovered() {
-            shadow(&p, ur, R_SM, Vec2::ZERO, 8.0, 0.0, rgba(45, 212, 191, 0.12));
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        icon_external(&p, Pos2::new(ur.left() + 12.0 + 8.0, ur.center().y), 16.0, fade(TEAL, k));
-        let port = c.port.unwrap_or(0);
-        p.text(Pos2::new(ur.left() + 12.0 + 16.0 + 8.0, ur.center().y), Align2::LEFT_CENTER, format!("localhost:{port}"), bold(13.0), fade(TEAL, k));
-        let face = if resp.hovered() { "( O.O )" } else { "( o.o )" };
-        p.text(Pos2::new(ur.right() - 12.0, ur.center().y), Align2::RIGHT_CENTER, face, mono(11.0), fade(TEAL, 0.45 * k));
-        if resp.on_hover_text("Open in browser").clicked() && !restarting {
-            actions.push(Action::OpenUrl(port));
-        }
-    } else {
-        let k = if hover { 0.85 } else { 0.5 };
-        p.rect_filled(ur, R_SM, rgba(0, 0, 0, 0.22));
-        let port = c.port.map(|p| p.to_string()).unwrap_or_else(|| "????".into());
-        p.text(Pos2::new(ur.left() + 12.0, ur.center().y), Align2::LEFT_CENTER, format!("localhost:{port}"), mono(11.0), fade(hex(0x585e68), k));
-        let face = if hover { "( o.o )" } else { "( -.- )" };
-        p.text(Pos2::new(ur.right() - 12.0, ur.center().y), Align2::RIGHT_CENTER, face, mono(11.0), fade(hex(0x7e838d), k * 0.8));
-    }
-
-    // actions: the state key on the left, tools on the right
-    let ay = y + 108.0;
-    if lit {
-        // Stop + Restart: one key with a groove
-        let font = bold(12.0);
-        let sw = 14.0 + 14.0 + 5.0 + text_w(ui, "Stop", font.clone()) + 14.0;
-        let group = Rect::from_min_size(Pos2::new(x0, ay + 2.0), Vec2::new(sw + 36.0, 32.0));
-        let stop_r = Rect::from_min_size(group.min, Vec2::new(sw, 32.0));
-        let rs_r = Rect::from_min_max(Pos2::new(stop_r.right(), group.top()), group.max);
-        let kind = if restarting { KeyKind::Metal } else { KeyKind::Stop };
-        let s_resp = ui.interact(stop_r, id.with("stop"), if restarting { Sense::hover() } else { Sense::click() });
-        let r_resp = ui.interact(rs_r, id.with("restart"), if c.busy.is_some() { Sense::hover() } else { Sense::click() });
-        let look = key_look(kind, false);
-        if let Some(g) = look.glow {
-            shadow(&p, group, R_SM, Vec2::ZERO, 12.0, 0.0, g);
-        }
-        shadow(&p, group, R_SM, Vec2::new(0.0, 3.0), 6.0, 0.0, rgba(0, 0, 0, 0.6));
-        p.rect_filled(group.translate(Vec2::new(0.0, 2.0)), R_SM, look.ledge);
-        let left_r = egui::Rounding { nw: R_SM, sw: R_SM, ne: 0.0, se: 0.0 };
-        let right_r = egui::Rounding { nw: 0.0, sw: 0.0, ne: R_SM, se: R_SM };
-        let sl = key_look(kind, s_resp.hovered() && !restarting);
-        let rl = key_look(kind, r_resp.hovered() && !restarting);
-        vgrad(&p, stop_r, left_r, &sl.stops);
-        vgrad(&p, rs_r, right_r, &rl.stops);
-        rim(&p, group, R_SM, look.rim);
-        p.line_segment([Pos2::new(rs_r.left(), rs_r.top() + 1.0), Pos2::new(rs_r.left(), rs_r.bottom() - 1.0)], Stroke::new(1.0, rgba(0, 0, 0, 0.55)));
-        p.line_segment([Pos2::new(rs_r.left() + 1.0, rs_r.top() + 1.0), Pos2::new(rs_r.left() + 1.0, rs_r.bottom() - 1.0)], Stroke::new(1.0, rgba(255, 237, 213, 0.13)));
-        let tcol = if restarting { TEXT_3 } else { sl.text };
-        icon_stop(&p, Pos2::new(stop_r.left() + 21.0, stop_r.center().y), 14.0, tcol);
-        p.text(Pos2::new(stop_r.left() + 33.0, stop_r.center().y), Align2::LEFT_CENTER, "Stop", font, tcol);
-        if restarting {
-            spinner(&p, rs_r.center(), 6.0, t, TEAL);
-        } else {
-            icon_restart(&p, rs_r.center(), 15.0, rl.text);
-        }
-        if s_resp.hovered() || r_resp.hovered() {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if s_resp.clicked() {
-            actions.push(Action::Stop(c.name.clone()));
-        }
-        if r_resp.on_hover_text("Restart").clicked() {
-            actions.push(Action::Restart(c.name.clone()));
-        }
-    } else if starting {
-        let font = bold(12.0);
-        let w = 14.0 + 14.0 + 5.0 + text_w(ui, "Starting", font.clone()) + 14.0;
-        let r = Rect::from_min_size(Pos2::new(x0, ay + 2.0), Vec2::new(w, 32.0));
-        key(ui, r, id.with("launch"), KeyKind::Launch, R_SM, false, |p, r, col| {
-            spinner(p, Pos2::new(r.left() + 21.0, r.center().y), 5.5, t, TEAL);
-            p.text(Pos2::new(r.left() + 33.0, r.center().y), Align2::LEFT_CENTER, "Starting", font, col);
-        });
-    } else {
-        let (resp, _) = label_key(ui, None, x0, ay + 2.0, 32.0, id.with("launch"), KeyKind::Launch, "Launch", icon_play);
-        if resp.clicked() {
-            actions.push(Action::Launch(c.name.clone()));
-        }
-    }
-    // tools: editor, Finder, terminal, git pull — one quiet segmented metal control
-    const TOOLS: [&str; 4] = ["Open in editor", "Reveal in Finder", "Open in terminal", "git pull --ff-only"];
-    const TOOL_W: f32 = 36.0;
-    let tools = Rect::from_min_size(Pos2::new(x1 - TOOL_W * TOOLS.len() as f32, ay), Vec2::new(TOOL_W * TOOLS.len() as f32, 36.0));
-    paint_key(&p, tools, R_SM, &key_look(KeyKind::Metal, false), false);
-    for i in 1..TOOLS.len() {
-        let gx = tools.left() + TOOL_W * i as f32;
-        p.line_segment([Pos2::new(gx, tools.top() + 1.0), Pos2::new(gx, tools.bottom() - 1.0)], Stroke::new(1.0, rgba(0, 0, 0, 0.5)));
-    }
-    for (i, tip) in TOOLS.iter().enumerate() {
-        let r = Rect::from_min_size(Pos2::new(tools.left() + TOOL_W * i as f32, tools.top()), Vec2::new(TOOL_W, 36.0));
-        let resp = ui.interact(r, id.with(("tool", i)), Sense::click());
-        if resp.hovered() {
-            let round = if i == 0 {
-                egui::Rounding { nw: R_SM, sw: R_SM, ne: 0.0, se: 0.0 }
-            } else if i == TOOLS.len() - 1 {
-                egui::Rounding { nw: 0.0, sw: 0.0, ne: R_SM, se: R_SM }
-            } else {
-                egui::Rounding::ZERO
-            };
-            p.rect_filled(r.shrink(1.0), round, rgba(255, 255, 255, 0.06));
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let col = if resp.hovered() { hex(0xdfe2e7) } else { TEXT_2 };
-        match i {
-            0 => icon_code(&p, r.center(), 15.0, col),
-            1 => icon_folder(&p, r.center(), 15.0, col, 1.6),
-            2 => icon_terminal(&p, r.center(), 15.0, col),
-            _ => icon_download(&p, r.center(), 15.0, col),
-        }
-        if resp.on_hover_text(*tip).clicked() {
-            actions.push(match i {
-                0 => Action::Editor(c.path.clone()),
-                1 => Action::Finder(c.path.clone()),
-                2 => Action::Terminal(c.path.clone()),
-                _ => Action::Pull(c.path.clone()),
-            });
-        }
-    }
-
-    // footer: what it is, then where it is filed
-    let fy = y + 156.0 + 9.0;
-    let mut fx = x0;
-    let kind = c.kind.label();
-    let tw = text_w(ui, kind, ui_font(10.0)) + 16.0;
-    let tr = Rect::from_min_size(Pos2::new(fx, fy - 8.0), Vec2::new(tw, 16.0));
-    engraved(&p, tr);
-    p.text(tr.center(), Align2::CENTER_CENTER, kind, ui_font(10.0), TAG_TEXT);
-    fx = tr.right() + 4.0;
-    for f in &c.folders {
-        let w = 8.0 + 9.0 + 4.0 + text_w(ui, f, ui_font(10.0)) + 4.0 + 12.0 + 4.0;
-        if fx + w > x1 - 30.0 {
-            break;
-        }
-        let r = Rect::from_min_size(Pos2::new(fx, fy - 8.0), Vec2::new(w, 16.0));
-        engraved(&p, r);
-        icon_folder(&p, Pos2::new(r.left() + 8.0 + 4.5, fy), 10.0, FOLDER_TEXT, 1.3);
-        let lr = p.text(Pos2::new(r.left() + 8.0 + 9.0 + 4.0, fy), Align2::LEFT_CENTER, f, ui_font(10.0), FOLDER_TEXT);
-        let xr = Rect::from_center_size(Pos2::new(lr.right() + 4.0 + 6.0, fy), Vec2::splat(12.0));
-        let xresp = ui.interact(xr, id.with(("untag", f)), Sense::click());
-        icon_x(&p, xr.center(), 9.0, fade(FOLDER_TEXT, if xresp.hovered() { 1.0 } else { 0.5 }));
-        if xresp.on_hover_text(format!("Remove from {f}")).clicked() {
-            actions.push(Action::Assign(f.clone(), c.name.clone(), false));
-        }
-        fx = r.right() + 4.0;
-    }
-
-    // drag grip: drop it on a folder chip to file the project there
-    let hr = Rect::from_min_size(Pos2::new(rect.right() - 8.0 - 26.0, rect.bottom() - 8.0 - 26.0), Vec2::splat(26.0));
-    let hresp = ui.interact(hr, id.with("grip"), Sense::drag());
-    let hot = hresp.hovered() || hresp.dragged();
-    if hot {
-        vgrad(&p, hr, 8.0, &[(0.0, hex(0x2c2f34)), (1.0, hex(0x1e2024))]);
-        ctx.set_cursor_icon(if hresp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
-    } else {
-        p.rect_filled(hr, 8.0, PLATE);
-    }
-    rim(&p, hr, 8.0, rgba(255, 255, 255, 0.08));
-    let dot = if hot { LED } else { rgba(255, 255, 255, 0.4) };
-    for (dx, dy) in [(-2.5, -2.5), (2.5, -2.5), (-2.5, 2.5), (2.5, 2.5)] {
-        p.circle_filled(hr.center() + Vec2::new(dx, dy), 1.15, dot);
-    }
-    if hresp.drag_started() {
-        DragAndDrop::set_payload(&ctx, c.name.clone());
-    }
-    if !hresp.dragged() {
-        hresp.on_hover_text("Drag onto a folder chip to add it there");
-    }
-    if dragged_me {
-        p.rect_filled(rect, R_CARD, rgba(0, 0, 0, 0.5));
+        p.rect_filled(r, egui::Rounding::same(2.0), th.edge_ctl);
     }
 }
 
-/// An engraved mark cut into the face: not a control.
-fn engraved(p: &egui::Painter, r: Rect) {
-    p.rect_filled(r, 100.0, TAG);
-    let top = p.with_clip_rect(Rect::from_min_max(r.min, Pos2::new(r.max.x, r.min.y + 3.0)));
-    top.rect_stroke(r.shrink(0.5), 100.0, Stroke::new(1.0, rgba(0, 0, 0, 0.85)));
-    p.line_segment([Pos2::new(r.left() + 6.0, r.bottom() + 0.5), Pos2::new(r.right() - 6.0, r.bottom() + 0.5)], Stroke::new(1.0, rgba(255, 255, 255, 0.06)));
+/// `--page` — the light skin's own page, which is not flat paper:
+/// `linear-gradient(135deg, #FAEFE4 0%, #F1EEE9 42%, #EBEDF1 100%)`
+/// (`src/skew.css`, "THE PAGE KEEPS THE OLD DOCUMENT'S WARMTH"), warm cream at
+/// the top left and cool grey at the bottom right, with the window standing on
+/// it. egui has no gradient and the crate's `vgrad` is vertical only, so the
+/// diagonal is a mesh: a grid whose vertices are coloured by where they fall
+/// along the 135° line. Painted on the window, not on the scrolled content —
+/// the CSS says `background-attachment: fixed`.
+///
+/// THE RULING IS NOT HERE ANY MORE. `console` draws the desk INSIDE the
+/// launcher's window and the ground around it stays plain, because a desk that
+/// ran out past the application is a desk belonging to the document.
+fn page(p: &egui::Painter, rect: Rect) {
+    const STOPS: [(f32, Color32); 3] = [
+        (0.0, Color32::from_rgb(0xFA, 0xEF, 0xE4)),
+        (0.42, Color32::from_rgb(0xF1, 0xEE, 0xE9)),
+        (1.0, Color32::from_rgb(0xEB, 0xED, 0xF1)),
+    ];
+    /// How finely the quad is cut. The colour is linear in x and y between the
+    /// stops, so the only error a grid makes is at the 42% knee, across one
+    /// cell — invisible between two creams three levels apart.
+    const N: usize = 24;
+    fn at(t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+        for w in STOPS.windows(2) {
+            let ((t0, a), (t1, b)) = (w[0], w[1]);
+            if t <= t1 {
+                let k = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
+                let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k) as u8;
+                return Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()));
+            }
+        }
+        STOPS[STOPS.len() - 1].1
+    }
+    // CSS 0deg points up and the angle runs clockwise, so 135deg is
+    // (sin a, -cos a) in screen coordinates: down and to the right. The line
+    // is centred on the box and its length is |w·sin a| + |h·cos a|.
+    let d = Vec2::splat(std::f32::consts::FRAC_1_SQRT_2);
+    let len = ((rect.width() + rect.height()) * std::f32::consts::FRAC_1_SQRT_2).max(1.0);
+    let c = rect.center();
+    let mut m = egui::epaint::Mesh::default();
+    for iy in 0..=N {
+        for ix in 0..=N {
+            let q = pos2(
+                rect.left() + rect.width() * ix as f32 / N as f32,
+                rect.top() + rect.height() * iy as f32 / N as f32,
+            );
+            m.colored_vertex(q, at(0.5 + (q - c).dot(d) / len));
+        }
+    }
+    let row = N as u32 + 1;
+    for iy in 0..N as u32 {
+        for ix in 0..N as u32 {
+            let i = iy * row + ix;
+            m.add_triangle(i, i + 1, i + row + 1);
+            m.add_triangle(i, i + row + 1, i + row);
+        }
+    }
+    p.add(egui::Shape::mesh(m));
 }
