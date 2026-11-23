@@ -164,8 +164,13 @@ pub fn show_dashboard(ctx: &eframe::egui::Context) {
     set_accessory(false);
     if let Some(mtm) = objc2::MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
+        // Only the dashboard. app.windows() also holds the status-item window
+        // and the tray menu's window; ordering those front leaves a transparent
+        // window on screen that eats clicks meant for whatever is underneath.
         for w in app.windows().iter() {
-            w.makeKeyAndOrderFront(None);
+            if w.canBecomeMainWindow() {
+                w.makeKeyAndOrderFront(None);
+            }
         }
         app.activateIgnoringOtherApps(true);
     }
