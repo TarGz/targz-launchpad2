@@ -67,7 +67,6 @@ impl Card {
         match (self.busy, &self.report) {
             (Some(Busy::Starting), _) => Some(PullState::Ok("starting…".into())),
             (Some(Busy::Restarting), _) => Some(PullState::Ok("restarting…".into())),
-            (Some(Busy::Stopping), _) => Some(PullState::Ok("stopping…".into())),
             (None, Some(Report::Run(p))) => Some(PullState::Run(*p)),
             (None, Some(Report::Ok(m))) => Some(PullState::Ok(m.clone())),
             (None, Some(Report::Err(m))) | (None, Some(Report::Fail(m))) => Some(PullState::Err(m.clone())),

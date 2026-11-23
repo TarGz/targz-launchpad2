@@ -257,29 +257,15 @@ impl Config {
 
 // ── Projects ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    Node,
-    Jekyll,
-    Static,
-}
-
-impl Kind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Kind::Node => "node",
-            Kind::Jekyll => "jekyll",
-            Kind::Static => "static",
-        }
-    }
-}
-
+/// A folder on the rack. There is no `kind` and no `description`: the card
+/// dropped both — a runtime label that cannot be wrong cannot be read either,
+/// and forty cards of prose is a page you scroll past. `spawn` works out how
+/// to start a project by reading its own files when it starts it, so neither
+/// was ever the thing that launched anything.
 #[derive(Clone, Debug)]
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
-    pub kind: Kind,
-    pub description: String,
     pub default_port: Option<u16>,
     pub group: Option<String>,
 }
@@ -293,35 +279,34 @@ fn dev_script(pkg: &Value) -> Option<String> {
     s.get("dev").and_then(Value::as_str).or_else(|| s.get("start").and_then(Value::as_str)).map(String::from)
 }
 
+/// A directory is a project when it is one of the three things this launcher
+/// knows how to start. WHICH of the three is not kept: it is answered again
+/// from the same files at the moment of launching, and a copy of an answer is
+/// a copy that can be wrong.
 fn scan_single(name: &str, dir: &Path) -> Option<Project> {
-    let mut kind = None;
-    let mut description = String::new();
+    let mut found = false;
     let mut default_port = None;
     let pkg_path = dir.join("package.json");
     if pkg_path.exists() {
         if let Some(pkg) = read_json(&pkg_path) {
-            description = pkg.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-            kind = Some(Kind::Node);
+            found = true;
             default_port = dev_script(&pkg).as_deref().and_then(find_port);
         }
     }
     let jekyll = dir.join("_config.yml");
-    if kind.is_none() && jekyll.exists() {
-        kind = Some(Kind::Jekyll);
+    if !found && jekyll.exists() {
+        found = true;
         if let Ok(yml) = fs::read_to_string(&jekyll) {
-            if let Some(d) = yml_value(&yml, "description") {
-                description = d.trim_matches(|c| c == '"' || c == '\'').trim().to_string();
-            }
             default_port = yml_port(&yml);
         }
         if default_port.is_none() {
             default_port = fs::read_to_string(dir.join("startlocaldev.sh")).ok().as_deref().and_then(find_port);
         }
     }
-    if kind.is_none() && dir.join("index.html").exists() {
-        kind = Some(Kind::Static);
+    if !found && dir.join("index.html").exists() {
+        found = true;
     }
-    Some(Project { name: name.to_string(), path: dir.to_path_buf(), kind: kind?, description, default_port, group: None })
+    found.then(|| Project { name: name.to_string(), path: dir.to_path_buf(), default_port, group: None })
 }
 
 fn listable(entry: &fs::DirEntry) -> Option<String> {
@@ -470,9 +455,11 @@ pub struct Run {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// NO `Stopping`. Stopping is synchronous — the call that asks for it has
+/// already done it by the time the next frame draws — so a card could never
+/// be caught in that state and nothing ever put it there.
 pub enum Busy {
     Starting,
-    Stopping,
     Restarting,
 }
 
