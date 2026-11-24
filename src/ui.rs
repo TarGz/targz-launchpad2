@@ -5,27 +5,45 @@
 //! Nothing here paints a key or a well by hand — the drawings are the
 //! crate's, and the pixels move only when its pinned `rev` moves.
 //!
-//! THE LAUNCHER IS A WINDOW, NOT A PANEL. The ruled desk is INSIDE the
-//! `console` and the ground around it stays plain, because the desk belongs
-//! to the application and not to the document it is scrolling.
+//! THE LAUNCHER IS A WINDOW, NOT A PANEL. On the web the console is a ruled
+//! desk inset in a plain page, because there the launcher is one application
+//! among others on a document. Here the native window IS the application, so
+//! the desk is the window: ruled edge to edge, and pinned to the frame rather
+//! than to the content, because a desk that scrolled would belong to the
+//! document instead of to the program.
 
 use crate::core::{self, Busy, Report, Shared, UpdateState};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, Context, Event, Id, Key, LayerId, Layout, Order, Rect, Sense, Stroke, Ui, Vec2,
-    ViewportCommand,
+    self, pos2, vec2, Align, Align2, Context, Event, Id, Key, LayerId, Layout, Order, Rect, Sense,
+    Stroke, Ui, ViewportCommand,
 };
 use skew_egui::{
-    act, channel, con_say, console, empty_rack, mono, module_card, sel, sel_list, sel_list_size, slide, slot_field,
-    version_readout_h, ActStyle, Icon, Lens, ModuleHit, ModuleView, Part, PullHit, PullState, SlideKind, Theme, VerState,
-    MODULE_MIN_W,
+    act, channel, con_say, empty_rack, module_card, mono, paint_icon, sel, sel_list,
+    sel_list_size, slide, slot_field, version_readout_h, ActStyle, Icon, Lens, ModuleHit,
+    ModuleView, Part, PullHit, PullState, SlideKind, Theme, VerState, MODULE_MIN_W,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::collections::HashMap;
 
 const MAX_W: f32 = 1200.0;
 const PAD: f32 = 24.0;
-const GAP: f32 = 14.0;
+/// `grid_shapes`' fine pitch — one square of the ruled desk. The rack is built
+/// out of it so that the lines and the cards are the same drawing: a gutter is
+/// a whole number of squares, and so is a card.
+const GRID: f32 = 24.0;
+/// `grid_shapes`' heavy pitch, five fine squares.
+const COARSE: f32 = 120.0;
+/// WHERE THE RULING SITS, found by eye and kept. Snapping
+/// the rack to the heavy pitch was the other way round — it moved the cards to
+/// suit the desk, needed a 1152pt column to reach a 600 stride, and fell back
+/// to nothing at any narrower window. These three move the DESK instead, which
+/// is the thing with no content to lose. The ruling is drawn a little under
+/// pitch, so it reads true against the cards near the left and drifts slowly
+/// across: that is the fit that was judged right.
+const RULE_DX: f32 = 100.0;
+const RULE_DY: f32 = 10.0;
+const RULE_SCALE: f32 = 0.97;
 /// One control height for the whole strip: `.con-top` cuts every box in that
 /// row — the selector, the field, the keys, the readout — to one height.
 const CAP: f32 = 32.0;
@@ -69,7 +87,9 @@ impl Card {
             (Some(Busy::Restarting), _) => Some(PullState::Ok("restarting…".into())),
             (None, Some(Report::Run(p))) => Some(PullState::Run(*p)),
             (None, Some(Report::Ok(m))) => Some(PullState::Ok(m.clone())),
-            (None, Some(Report::Err(m))) | (None, Some(Report::Fail(m))) => Some(PullState::Err(m.clone())),
+            (None, Some(Report::Err(m))) | (None, Some(Report::Fail(m))) => {
+                Some(PullState::Err(m.clone()))
+            }
             (None, None) => None,
         }
     }
@@ -126,6 +146,13 @@ pub struct App {
     /// The filter field's own id, as egui minted it. `/` and Escape act on the
     /// field that is actually there, not on a name we hoped it would take.
     filter_id: Option<Id>,
+    /// Where the rack's left edge fell, which is where the desk is ruled from.
+    /// Written by `rack`, read when the ruling is drawn at the end of the frame.
+    grid_x: f32,
+    /// The gutter between two cards, in fine squares. Worked out with the
+    /// window's width, since it is what makes a card and its gutter come to a
+    /// whole heavy square.
+    gut: f32,
     /// when a finished report should leave, by project name
     linger: HashMap<String, f64>,
     ver: VerState,
@@ -159,6 +186,8 @@ impl App {
             frames: 0,
             focus_search: false,
             filter_id: None,
+            grid_x: 0.0,
+            gut: GRID,
             linger: HashMap::new(),
             ver: VerState::Idle(stamp()),
             ver_checking: false,
@@ -196,7 +225,8 @@ impl App {
                 Some(_) => {}
             }
         }
-        self.linger.retain(|n, _| matches!(c.reports.get(n), Some(Report::Ok(_))));
+        self.linger
+            .retain(|n, _| matches!(c.reports.get(n), Some(Report::Ok(_))));
         let cards: Vec<Card> = c
             .projects
             .iter()
@@ -221,16 +251,28 @@ impl App {
                 self.card_list = false;
             }
         }
-        (cards, folders, c.running.len(), c.cfg.git_dir_label.clone(), c.update.clone())
+        (
+            cards,
+            folders,
+            c.running.len(),
+            c.cfg.git_dir_label.clone(),
+            c.update.clone(),
+        )
     }
 
-    /// Which projects survive the three filters. Each one is applied to the
-    /// result of the last: folder, then running, then text.
-    fn in_filter(&self, p: &Card) -> bool {
-        let by_folder = self.folder == ALL
+    /// THE FOLDER NARROWING ON ITS OWN, which a typed query never escapes: a
+    /// folder is a place you went to, and a field that reached out of it would
+    /// be answering about a rack you are not looking at.
+    fn by_folder(&self, p: &Card) -> bool {
+        self.folder == ALL
             || (self.folder == NONE && p.folders.is_empty())
-            || p.folders.iter().any(|f| *f == self.folder);
-        by_folder && (!self.only_up || p.running)
+            || p.folders.iter().any(|f| *f == self.folder)
+    }
+
+    /// Which projects survive the filters WITH THE FIELD EMPTY: folder, then
+    /// running. Typing widens the second one again — see `rack`.
+    fn in_filter(&self, p: &Card) -> bool {
+        self.by_folder(p) && (!self.only_up || p.running)
     }
 
     fn matches(&self, p: &Card) -> bool {
@@ -374,7 +416,11 @@ impl eframe::App for App {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Some(img) = image::RgbaImage::from_raw(image.size[0] as u32, image.size[1] as u32, image.as_raw().to_vec()) {
+                    if let Some(img) = image::RgbaImage::from_raw(
+                        image.size[0] as u32,
+                        image.size[1] as u32,
+                        image.as_raw().to_vec(),
+                    ) {
                         let _ = img.save(&path);
                     }
                     std::process::exit(0);
@@ -399,18 +445,70 @@ impl eframe::App for App {
         let inline = self.edit.is_some() || self.del.is_some() || self.list || self.card_list;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(th.paper))
+            .frame(egui::Frame::none().fill(th.pal.room))
             .show(ctx, |ui| {
-                page(ui.painter(), ui.max_rect());
-                egui::ScrollArea::vertical().id_salt("page").auto_shrink([false, false]).show(ui, |ui| {
-                    let col = (ui.available_width() - 2.0 * PAD).min(MAX_W - 2.0 * PAD).max(220.0);
-                    ui.vertical_centered(|ui| {
-                        ui.set_max_width(col);
-                        ui.add_space(PAD);
-                        self.window(ui, &cards, &folders, running_count, &git_label, &update, now, &mut actions);
-                        ui.add_space(PAD);
+                // THE DESK IS THE WINDOW. It was a 135° cream-to-grey gradient
+                // with a rounded console standing on it, which is what the WEB
+                // page is — because there the launcher is one application among
+                // several on a document, with its own title bar drawn above it.
+                // Here the native window IS that application. There is no
+                // document for it to stand on, so the ground around the console
+                // was a margin pretending to be a page, and the ruling stopped
+                // at a border for no reason the window could give. One surface
+                // now, ruled edge to edge.
+                //
+                // PAINTED ON THE WINDOW, NOT ON THE SCROLLED CONTENT — the CSS
+                // says `background-attachment: fixed`, and a desk that slid
+                // under the cards as you scrolled would be saying the desk
+                // belongs to the document.
+                ui.painter().rect_filled(ui.max_rect(), egui::Rounding::ZERO, th.pal.room);
+                // THE RULING IS RESERVED HERE AND DRAWN AT THE END OF THE FRAME,
+                // because where it starts is not known until the rack has been
+                // laid out and can say where its own left edge fell. The slot
+                // keeps it underneath everything all the same.
+                let ruling = ui.painter().add(egui::Shape::Noop);
+                egui::ScrollArea::vertical()
+                    .id_salt("page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // THE RACK IS CUT TO THE DESK'S OWN RULING, strip and
+                        // all, so the selector, the field and the first card
+                        // stand on one line and no line ever crosses a gutter
+                        // down the middle.
+                        //
+                        // The gutter is one fine square and a card is a whole
+                        // number of them; where the heavy line falls against
+                        // that is settled by RULE_*, which moves the desk
+                        // rather than the cards.
+                        let raw = (ui.available_width() - 2.0 * PAD)
+                            .min(MAX_W - 2.0 * PAD)
+                            .max(220.0);
+                        let n = ((raw + GRID) / (MODULE_MIN_W + GRID)).floor().max(1.0);
+                        let cw = (((raw - GRID * (n - 1.0)) / n) / GRID).floor() * GRID;
+                        self.gut = GRID;
+                        let col = (cw * n + GRID * (n - 1.0)).max(220.0);
+                        ui.vertical_centered(|ui| {
+                            ui.set_max_width(col);
+                            ui.add_space(PAD);
+                            self.window(
+                                ui,
+                                &cards,
+                                &folders,
+                                running_count,
+                                &git_label,
+                                &update,
+                                now,
+                                &mut actions,
+                            );
+                            ui.add_space(PAD);
+                        });
                     });
-                });
+                // The desk is ruled from the rack's own left edge: the first
+                // card's side IS a line, so every line after it lands on a card
+                // edge rather than in the middle of a gutter.
+                let o = pos2(self.grid_x + RULE_DX, ui.max_rect().top() + RULE_DY);
+                ui.painter()
+                    .set(ruling, egui::Shape::Vec(ruling_shapes(&th, ui.max_rect(), o, RULE_SCALE)));
             });
 
         self.toast_ui(ctx, now);
@@ -418,7 +516,11 @@ impl eframe::App for App {
         // keyboard: "/" focuses the filter, Esc clears it — but only when no
         // inline flow is up and nothing else is taking the keys.
         if !inline && !ctx.wants_keyboard_input() {
-            let slash = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if t == "/")));
+            let slash = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Text(t) if t == "/"))
+            });
             if slash {
                 self.focus_search = true;
             }
@@ -430,7 +532,9 @@ impl eframe::App for App {
             }
         }
 
-        let live = cards.iter().any(|c| c.busy.is_some() || matches!(c.report, Some(Report::Run(_))))
+        let live = cards
+            .iter()
+            .any(|c| c.busy.is_some() || matches!(c.report, Some(Report::Run(_))))
             || matches!(self.ver, VerState::Checking | VerState::Updating(_))
             || update.busy
             || update.checking;
@@ -441,7 +545,7 @@ impl eframe::App for App {
 
 impl App {
     /// The whole launcher: the strip, the running switch, then the rack, all
-    /// of it standing on the console's own ruled desk.
+    /// of it standing on the window's own ruled desk.
     #[allow(clippy::too_many_arguments)]
     fn window(
         &mut self,
@@ -455,7 +559,11 @@ impl App {
         actions: &mut Vec<Action>,
     ) {
         let th = self.th;
-        console(ui, &th, 18.0, |ui| {
+        // NO CONSOLE FRAME. `console` is a ruled desk with a rounded edge drawn
+        // INSIDE a window; this window has nothing around it to be inside of,
+        // and two rulings on two origins would not have met anyway.
+        {
+            let ui = &mut *ui;
             ui.set_width(ui.available_width());
             self.strip(ui, cards, running, git_label, update, now, actions);
             // TEN UNDER ROW ONE, because the switch belongs to it: a folder, a
@@ -479,7 +587,7 @@ impl App {
             // above the rack reads as the rack's first row.
             ui.add_space(32.0);
             self.rack(ui, cards, folders, actions);
-        });
+        }
     }
 
     /// ══ ROW ONE: A LINE OF BOXES ════════════════════════════════════════
@@ -512,9 +620,10 @@ impl App {
                 if version_readout_h(ui, &th, &ver, CAP).clicked() {
                     match ver {
                         VerState::Available(_) => actions.push(Action::Update),
-                        VerState::Idle(_) | VerState::Latest | VerState::Failed | VerState::Done(_) => {
-                            actions.push(Action::CheckUpdate)
-                        }
+                        VerState::Idle(_)
+                        | VerState::Latest
+                        | VerState::Failed
+                        | VerState::Done(_) => actions.push(Action::CheckUpdate),
                         _ => {}
                     }
                 }
@@ -522,7 +631,11 @@ impl App {
                 // the words stay on the strip: a check that failed has a
                 // reason, and the readout only has room to say that it did.
                 if (update.failed || update.busy) && !update.message.is_empty() {
-                    ui.label(mono(&update.message, 9.0).color(if update.failed { th.no_ink } else { th.ink_3 }));
+                    ui.label(mono(&update.message, 9.0).color(if update.failed {
+                        th.no_ink
+                    } else {
+                        th.ink_3
+                    }));
                 }
                 channel(ui, &th);
                 // ── and what you do to the whole rack
@@ -530,7 +643,11 @@ impl App {
                     && act(
                         ui,
                         &th,
-                        &[Part::Lens(Lens::Stop), Part::Text("STOP ALL"), Part::Count(running)],
+                        &[
+                            Part::Lens(Lens::Stop),
+                            Part::Text("STOP ALL"),
+                            Part::Count(running),
+                        ],
                         ActStyle::Aux,
                         CAP,
                         true,
@@ -542,9 +659,16 @@ impl App {
                 }
                 // THE GIT DIRECTORY RIDES ON RESCAN. It is the answer to "look
                 // for projects WHERE", so it belongs on the key that looks.
-                if act(ui, &th, &[Part::Icon(Icon::Restart), Part::Text("RESCAN")], ActStyle::Aux, CAP, true)
-                    .on_hover_text(format!("Look for projects again — {git_label}"))
-                    .clicked()
+                if act(
+                    ui,
+                    &th,
+                    &[Part::Icon(Icon::Restart), Part::Text("RESCAN")],
+                    ActStyle::Aux,
+                    CAP,
+                    true,
+                )
+                .on_hover_text(format!("Look for projects again — {git_label}"))
+                .clicked()
                 {
                     actions.push(Action::Refresh);
                 }
@@ -571,7 +695,10 @@ impl App {
     /// still up.
     fn armed_row(&mut self, ui: &mut Ui, cards: &[Card], name: &str) {
         let th = self.th;
-        let n = cards.iter().filter(|p| p.folders.iter().any(|f| f == name)).count();
+        let n = cards
+            .iter()
+            .filter(|p| p.folders.iter().any(|f| f == name))
+            .count();
         let tail = if n > 0 {
             format!(
                 " — {n} project{} go back to no folder. Nothing on disk is touched.",
@@ -583,7 +710,16 @@ impl App {
         con_say(ui, &th, "Delete ", name, &tail);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if act(ui, &th, &[Part::Icon(Icon::Trash), Part::Text("DELETE")], ActStyle::Halt, CAP, true).clicked() {
+            if act(
+                ui,
+                &th,
+                &[Part::Icon(Icon::Trash), Part::Text("DELETE")],
+                ActStyle::Halt,
+                CAP,
+                true,
+            )
+            .clicked()
+            {
                 self.do_delete();
             }
             if act(ui, &th, &[Part::Text("CANCEL")], ActStyle::Aux, CAP, true).clicked() {
@@ -609,15 +745,28 @@ impl App {
         // hit by mistake empties a folder. A folder being named for the first
         // time does not exist yet, so there is nothing to bin.
         let bin = (mode == Edit::Rename).then(|| {
-            act(ui, &th, &[Part::Icon(Icon::Trash)], ActStyle::Aux, CAP, true).on_hover_text("Delete this folder")
+            act(
+                ui,
+                &th,
+                &[Part::Icon(Icon::Trash)],
+                ActStyle::Aux,
+                CAP,
+                true,
+            )
+            .on_hover_text("Delete this folder")
         });
-        let hint = if mode == Edit::New { "NEW FOLDER" } else { "FOLDER NAME" };
+        let hint = if mode == Edit::New {
+            "NEW FOLDER"
+        } else {
+            "FOLDER NAME"
+        };
         let f = slot_field(ui, &th, 186.0, CAP, None, hint, &mut self.buf);
         if self.focus_buf {
             f.request_focus();
             self.focus_buf = false;
         }
-        let ok = act(ui, &th, &[Part::Icon(Icon::Check)], ActStyle::Go, CAP, true).on_hover_text("Save this name");
+        let ok = act(ui, &th, &[Part::Icon(Icon::Check)], ActStyle::Go, CAP, true)
+            .on_hover_text("Save this name");
 
         // THE ORDER THESE ARE RESOLVED IN IS THE WHOLE CORRECTNESS OF THE ROW.
         // ESCAPE FIRST: a `TextEdit` also loses focus on Escape, so a commit
@@ -627,7 +776,9 @@ impl App {
         // otherwise the bin arrives to delete a folder that has just been
         // renamed out from under it.
         let esc = ui.input(|i| i.key_pressed(Key::Escape));
-        let binning = bin.as_ref().is_some_and(|b| b.clicked() || b.is_pointer_button_down_on());
+        let binning = bin
+            .as_ref()
+            .is_some_and(|b| b.clicked() || b.is_pointer_button_down_on());
         if esc {
             self.edit = None;
         } else if binning {
@@ -653,9 +804,16 @@ impl App {
             self.list = !self.list;
         }
         if self.named()
-            && act(ui, &th, &[Part::Icon(Icon::Pencil)], ActStyle::Aux, CAP, true)
-                .on_hover_text("Rename or delete this folder")
-                .clicked()
+            && act(
+                ui,
+                &th,
+                &[Part::Icon(Icon::Pencil)],
+                ActStyle::Aux,
+                CAP,
+                true,
+            )
+            .on_hover_text("Rename or delete this folder")
+            .clicked()
         {
             self.edit = Some(Edit::Rename);
             self.buf = cur;
@@ -664,13 +822,49 @@ impl App {
         ui.add_space(10.0);
         // THE FIELD IS THE ONLY THING THAT GIVES, and it never gives
         // everything: at 200 the placeholder still reads, and a field narrower
-        // than its own label cannot be told from a button.
-        let w = ui.available_width().clamp(200.0, 420.0);
-        let f = ui.push_id("lp-filter", |ui| slot_field(ui, &th, w, CAP, Some(Icon::Search), "FILTER", &mut self.search)).inner;
+        // than its own label cannot be told from a button. It does not take
+        // the whole row either — a filter that runs to the far edge of the
+        // window reads as the thing the window is for, and this one is a way
+        // of looking at the rack, not the rack itself.
+        let w = ui.available_width().clamp(200.0, 260.0);
+        let f = ui
+            .push_id("lp-filter", |ui| {
+                slot_field(
+                    ui,
+                    &th,
+                    w,
+                    CAP,
+                    Some(Icon::Search),
+                    "FILTER",
+                    &mut self.search,
+                )
+            })
+            .inner;
         self.filter_id = Some(f.id);
         if self.focus_search {
             f.request_focus();
             self.focus_search = false;
+        }
+        // THE WAY OUT OF THE FIELD, AT THE FAR END OF IT. Escape already
+        // empties it, which is no use at all to a hand on the mouse. It is
+        // there only while there is something to clear — an X over an empty
+        // field is a key that does nothing, in the one place the eye checks to
+        // find out whether the rack is filtered.
+        if !self.search.is_empty() {
+            // `f` is the TEXT's rect, inset 8 from the well's right edge.
+            let at = pos2(f.rect.right() - 6.0, f.rect.center().y);
+            let hit = Rect::from_center_size(at, vec2(18.0, 18.0));
+            // The field under it sets the I-beam; this is a key, and every key
+            // in the system points. Said after the field, which is what makes
+            // it the cursor the frame ends on.
+            let x = ui
+                .interact(hit, Id::new("lp-filter-clear"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let ink = if x.hovered() { th.ink } else { th.ink_3 };
+            paint_icon(ui.painter(), Icon::Close, at, 11.0, 1.8, ink, 0.0);
+            if x.clicked() {
+                self.search.clear();
+            }
         }
     }
 
@@ -694,7 +888,9 @@ impl App {
         let picked = egui::Area::new(Id::new("lp-sellist"))
             .order(Order::Foreground)
             .fixed_pos(at)
-            .show(ui.ctx(), |ui| sel_list(ui, &th, 186.0, &refs, cur, &["NEW FOLDER…"]))
+            .show(ui.ctx(), |ui| {
+                sel_list(ui, &th, 186.0, &refs, cur, &["NEW FOLDER…"])
+            })
             .inner;
         let plate = Rect::from_min_size(at, sel_list_size(refs.len(), 1, 186.0));
         if let Some(i) = picked {
@@ -723,8 +919,32 @@ impl App {
     /// ══ THE RACK ════════════════════════════════════════════════════════
     fn rack(&mut self, ui: &mut Ui, cards: &[Card], folders: &[String], actions: &mut Vec<Action>) {
         let th = self.th;
-        let shown: Vec<&Card> = cards.iter().filter(|c| self.in_filter(c)).filter(|c| self.matches(c)).collect();
-        if shown.is_empty() {
+        // THE SWITCH DECIDES WHAT IS SHOWN, TYPING DECIDES WHAT IS FOUND.
+        // Only-what-is-running ANDed with the field could only ever hand back
+        // something already on screen, which made the field useless for the
+        // one thing anybody reaches for it to do: find a project you CANNOT
+        // see. So a typed query looks past the switch, and what is not up
+        // comes after what is — its own rows, under its own label, wearing the
+        // dead strip the card already draws for it.
+        let searching = !self.search.trim().is_empty();
+        let split = self.only_up && searching;
+        let pool: Vec<&Card> = cards
+            .iter()
+            .filter(|c| {
+                if split {
+                    self.by_folder(c)
+                } else {
+                    self.in_filter(c)
+                }
+            })
+            .filter(|c| self.matches(c))
+            .collect();
+        let (up, down): (Vec<&Card>, Vec<&Card>) = if split {
+            pool.iter().copied().partition(|c| c.running)
+        } else {
+            (pool, Vec::new())
+        };
+        if up.is_empty() && down.is_empty() {
             let (txt, out) = if self.filtering() {
                 ("NOTHING MATCHES", Some("CLEAR FILTERS"))
             } else {
@@ -740,49 +960,87 @@ impl App {
             return;
         }
         let open = self.card.clone();
-        let cols = ((ui.available_width() + GAP) / (MODULE_MIN_W + GAP)).floor().max(1.0) as usize;
+        // ONE GAP, BOTH WAYS. A row is stepped by GAP on top of the style's own
+        // vertical spacing, while `columns` leaves only `item_spacing.x`
+        // between the cards IN a row — 8, the style's small step. The lanes
+        // came out nearly three times tighter across than down, which reads as
+        // columns of cards standing side by side rather than as one rack. The
+        // down step is the one that was right, so it is the one both take.
+        // THE GUTTER IS THE SAME BOTH WAYS, and it is the one the window's
+        // width settled on: the lines and the cards then share one rhythm
+        // instead of being two drawings laid over each other.
+        let step = self.gut;
+        ui.spacing_mut().item_spacing.x = step;
+        self.grid_x = ui.cursor().left();
+        // And the count is worked out with the gap the row will actually use:
+        // computed against a narrower one it fits a column that is then
+        // squeezed under MODULE_MIN_W to pay for the spacing.
+        let cols = ((ui.available_width() + step) / (MODULE_MIN_W + step))
+            .floor()
+            .max(1.0) as usize;
         let mut hits: Vec<(String, ModuleHit)> = Vec::new();
         let mut open_rect = None;
-        for row in shown.chunks(cols) {
-            ui.columns(cols, |c| {
-                for (k, card) in row.iter().enumerate() {
-                    // THE FOLDER IS THE STAMP AND THE REST ARE TAGS. Core lets
-                    // a project sit in several folders; the card names the one
-                    // it leads with and carries the others beside it, so
-                    // nothing the config holds goes missing off the face.
-                    let tags: Vec<&str> = card.folders.iter().skip(1).map(String::as_str).collect();
-                    let line = card.line();
-                    let v = ModuleView {
-                        name: &card.name,
-                        port: card.port.unwrap_or(0),
-                        up: card.running,
-                        folder: card.folder(),
-                        tags: &tags,
-                        pull: line.as_ref(),
-                        editing: open.as_deref() == Some(card.name.as_str()),
-                    };
-                    let out = c[k].scope(|ui| module_card(ui, &th, &v));
-                    if open.as_deref() == Some(card.name.as_str()) {
-                        open_rect = Some(out.response.rect);
+        // The two groups never share a row: a stopped card beside a running one
+        // in the same row would read as one list again.
+        for (gi, group) in [&up, &down].into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            if gi == 1 {
+                ui.add_space(6.0);
+                // The switch's own label, said in the switch's own off ink.
+                ui.label(mono("NOT RUNNING", 9.5).color(th.ink_2));
+                ui.add_space(10.0);
+            }
+            for row in group.chunks(cols) {
+                ui.columns(cols, |c| {
+                    for (k, card) in row.iter().enumerate() {
+                        // THE FOLDER IS THE STAMP AND THE REST ARE TAGS. Core lets
+                        // a project sit in several folders; the card names the one
+                        // it leads with and carries the others beside it, so
+                        // nothing the config holds goes missing off the face.
+                        let tags: Vec<&str> =
+                            card.folders.iter().skip(1).map(String::as_str).collect();
+                        let line = card.line();
+                        let v = ModuleView {
+                            name: &card.name,
+                            port: card.port.unwrap_or(0),
+                            up: card.running,
+                            folder: card.folder(),
+                            tags: &tags,
+                            pull: line.as_ref(),
+                            editing: open.as_deref() == Some(card.name.as_str()),
+                        };
+                        let out = c[k].scope(|ui| module_card(ui, &th, &v));
+                        if open.as_deref() == Some(card.name.as_str()) {
+                            open_rect = Some(out.response.rect);
+                        }
+                        if let Some(h) = out.inner {
+                            hits.push((card.name.clone(), h));
+                        }
                     }
-                    if let Some(h) = out.inner {
-                        hits.push((card.name.clone(), h));
-                    }
-                }
-            });
-            ui.add_space(GAP);
+                });
+                // The row's own vertical spacing is part of the step.
+                ui.add_space((step - ui.spacing().item_spacing.y).max(0.0));
+            }
         }
         if let Some(r) = open_rect {
             self.card_rect = r;
         }
         for (name, h) in hits {
-            let Some(card) = cards.iter().find(|c| c.name == name) else { continue };
+            let Some(card) = cards.iter().find(|c| c.name == name) else {
+                continue;
+            };
             match h {
                 // THE DRAWER SURVIVES THE RACK BEING REDRAWN UNDER IT: filing
                 // a project repaints everything, and a drawer that shut every
                 // time you used it is one you open twice.
                 ModuleHit::Edit => {
-                    self.card = if self.card.as_deref() == Some(name.as_str()) { None } else { Some(name.clone()) };
+                    self.card = if self.card.as_deref() == Some(name.as_str()) {
+                        None
+                    } else {
+                        Some(name.clone())
+                    };
                     self.card_list = false;
                 }
                 ModuleHit::Drawer => self.card_list = !self.card_list,
@@ -800,7 +1058,9 @@ impl App {
                     Some(Report::Fail(_)) => Action::Launch(name),
                     _ => Action::Pull(name, card.path.clone()),
                 }),
-                ModuleHit::Pull2(PullHit::Terminal) => actions.push(Action::Terminal(card.path.clone())),
+                ModuleHit::Pull2(PullHit::Terminal) => {
+                    actions.push(Action::Terminal(card.path.clone()))
+                }
                 ModuleHit::Pull2(PullHit::Dismiss) => actions.push(Action::Dismiss(name)),
             }
         }
@@ -811,12 +1071,22 @@ impl App {
     /// inside it: `module_card` draws that selector itself and returns a hit,
     /// not a rect, and the card is the thing that stays put while the rack
     /// scrolls under it.
-    fn drawer_plate(&mut self, ui: &mut Ui, cards: &[Card], folders: &[String], actions: &mut Vec<Action>) {
+    fn drawer_plate(
+        &mut self,
+        ui: &mut Ui,
+        cards: &[Card],
+        folders: &[String],
+        actions: &mut Vec<Action>,
+    ) {
         if !self.card_list {
             return;
         }
-        let Some(name) = self.card.clone() else { return };
-        let Some(card) = cards.iter().find(|c| c.name == name) else { return };
+        let Some(name) = self.card.clone() else {
+            return;
+        };
+        let Some(card) = cards.iter().find(|c| c.name == name) else {
+            return;
+        };
         let th = self.th;
         let mut opts = vec![NONE.to_string()];
         opts.extend(folders.iter().cloned());
@@ -866,7 +1136,10 @@ impl App {
         let font = egui::FontId::monospace(11.0);
         let w = p.layout_no_wrap(msg.clone(), font.clone(), th.ink).size().x + 32.0;
         let rect = Rect::from_center_size(
-            pos2(screen.center().x, screen.bottom() - 42.0 + 8.0 * (1.0 - alpha)),
+            pos2(
+                screen.center().x,
+                screen.bottom() - 42.0 + 8.0 * (1.0 - alpha),
+            ),
             vec2(w.min(screen.width() - 40.0), 36.0),
         );
         let mut p = p;
@@ -956,6 +1229,44 @@ impl App {
 /// the height of the row, with its own small bloom. Unlit it is a milled bar.
 /// A round lamp between the switch and its name would be a third object in a
 /// part that has two.
+/// `grid_shapes` with the pitch opened up: the same drawing and the same two
+/// inks, with a scale the crate's own has no way to take. It is here and not
+/// called from there because RULE_SCALE is not 1 — the desk is ruled a little
+/// under pitch, which is the fit that read right against the cards.
+fn ruling_shapes(th: &Theme, rect: Rect, origin: egui::Pos2, scale: f32) -> Vec<egui::Shape> {
+    let mut out = Vec::new();
+    // the crate's own inks: navy on the cool room, white on the dark one
+    let base = match th.skin {
+        skew_egui::Skin::Light => egui::Color32::from_rgb(33, 62, 96),
+        skew_egui::Skin::Dark => egui::Color32::WHITE,
+    };
+    for (pitch, a) in [(GRID * scale, 0.035_f32), (COARSE * scale, 0.085)] {
+        if pitch < 2.0 {
+            continue;
+        }
+        let col = base.gamma_multiply(a);
+        let mut x = origin.x + ((rect.left() - origin.x) / pitch).ceil() * pitch;
+        while x < rect.right() {
+            out.push(egui::Shape::rect_filled(
+                Rect::from_min_size(pos2(x, rect.top()), vec2(1.0, rect.height())),
+                egui::Rounding::ZERO,
+                col,
+            ));
+            x += pitch;
+        }
+        let mut y = origin.y + ((rect.top() - origin.y) / pitch).ceil() * pitch;
+        while y < rect.bottom() {
+            out.push(egui::Shape::rect_filled(
+                Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 1.0)),
+                egui::Rounding::ZERO,
+                col,
+            ));
+            y += pitch;
+        }
+    }
+    out
+}
+
 fn pipe(ui: &mut Ui, th: &Theme, on: bool) {
     let (r, _) = ui.allocate_exact_size(vec2(4.0, 22.0), Sense::hover());
     if !ui.is_rect_visible(r) {
@@ -963,70 +1274,14 @@ fn pipe(ui: &mut Ui, th: &Theme, on: bool) {
     }
     let p = ui.painter();
     if on {
-        p.rect_filled(r.expand(3.0), egui::Rounding::same(5.0), th.primary.gamma_multiply(0.16));
+        p.rect_filled(
+            r.expand(3.0),
+            egui::Rounding::same(5.0),
+            th.primary.gamma_multiply(0.16),
+        );
         p.rect_filled(r, egui::Rounding::same(2.0), th.primary);
     } else {
         p.rect_filled(r, egui::Rounding::same(2.0), th.edge_ctl);
     }
 }
 
-/// `--page` — the light skin's own page, which is not flat paper:
-/// `linear-gradient(135deg, #FAEFE4 0%, #F1EEE9 42%, #EBEDF1 100%)`
-/// (`src/skew.css`, "THE PAGE KEEPS THE OLD DOCUMENT'S WARMTH"), warm cream at
-/// the top left and cool grey at the bottom right, with the window standing on
-/// it. egui has no gradient and the crate's `vgrad` is vertical only, so the
-/// diagonal is a mesh: a grid whose vertices are coloured by where they fall
-/// along the 135° line. Painted on the window, not on the scrolled content —
-/// the CSS says `background-attachment: fixed`.
-///
-/// THE RULING IS NOT HERE ANY MORE. `console` draws the desk INSIDE the
-/// launcher's window and the ground around it stays plain, because a desk that
-/// ran out past the application is a desk belonging to the document.
-fn page(p: &egui::Painter, rect: Rect) {
-    const STOPS: [(f32, Color32); 3] = [
-        (0.0, Color32::from_rgb(0xFA, 0xEF, 0xE4)),
-        (0.42, Color32::from_rgb(0xF1, 0xEE, 0xE9)),
-        (1.0, Color32::from_rgb(0xEB, 0xED, 0xF1)),
-    ];
-    /// How finely the quad is cut. The colour is linear in x and y between the
-    /// stops, so the only error a grid makes is at the 42% knee, across one
-    /// cell — invisible between two creams three levels apart.
-    const N: usize = 24;
-    fn at(t: f32) -> Color32 {
-        let t = t.clamp(0.0, 1.0);
-        for w in STOPS.windows(2) {
-            let ((t0, a), (t1, b)) = (w[0], w[1]);
-            if t <= t1 {
-                let k = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
-                let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k) as u8;
-                return Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()));
-            }
-        }
-        STOPS[STOPS.len() - 1].1
-    }
-    // CSS 0deg points up and the angle runs clockwise, so 135deg is
-    // (sin a, -cos a) in screen coordinates: down and to the right. The line
-    // is centred on the box and its length is |w·sin a| + |h·cos a|.
-    let d = Vec2::splat(std::f32::consts::FRAC_1_SQRT_2);
-    let len = ((rect.width() + rect.height()) * std::f32::consts::FRAC_1_SQRT_2).max(1.0);
-    let c = rect.center();
-    let mut m = egui::epaint::Mesh::default();
-    for iy in 0..=N {
-        for ix in 0..=N {
-            let q = pos2(
-                rect.left() + rect.width() * ix as f32 / N as f32,
-                rect.top() + rect.height() * iy as f32 / N as f32,
-            );
-            m.colored_vertex(q, at(0.5 + (q - c).dot(d) / len));
-        }
-    }
-    let row = N as u32 + 1;
-    for iy in 0..N as u32 {
-        for ix in 0..N as u32 {
-            let i = iy * row + ix;
-            m.add_triangle(i, i + 1, i + row + 1);
-            m.add_triangle(i, i + row + 1, i + row);
-        }
-    }
-    p.add(egui::Shape::mesh(m));
-}
