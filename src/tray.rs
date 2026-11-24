@@ -16,34 +16,29 @@ thread_local! {
     static LAST_SIG: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// A 36×36 template glyph: a launch arrow over a pad line.
+/// The menu-bar glyph: `tray.png`, loaded.
+///
+/// IT IS NOT THE APP ICON SCALED DOWN, AND IT IS NOT A DIFFERENT DRAWING
+/// EITHER. The icon's three sheets have gaps that land under a pixel at this
+/// size — reduced straight to 36 they merge into one blob and the thin
+/// trailing edges break off it entirely. `tray.svg` is the same idea drawn for
+/// a size where only three or four strokes fit: three sheets leaning the same
+/// way, fat enough to survive and far enough apart that the gaps are gaps.
+///
+/// It was a launch arrow over a pad line, which was a second mark for the same
+/// app — the one the user sees in the Dock and the one they see in the bar
+/// said different things about it.
+///
+/// BLACK WITH ALPHA AND NOTHING ELSE. macOS treats a menu-bar image as a
+/// template and inverts it for the dark bar, so any colour in the file is
+/// thrown away; what carries the shape is the alpha channel.
 fn icon() -> Icon {
-    let n = 36usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    let mut put = |x: usize, y: usize| {
-        let i = (y * n + x) * 4;
-        rgba[i + 3] = 255;
-    };
-    for y in 4..24 {
-        // triangle widening downwards, apex at y=4
-        let half = (y - 4) as f32 * 0.55 + 1.0;
-        let x0 = (18.0 - half).max(0.0) as usize;
-        let x1 = (18.0 + half).min(35.0) as usize;
-        for x in x0..x1 {
-            put(x, y);
-        }
-    }
-    for y in 24..27 {
-        for x in 15..21 {
-            put(x, y);
-        }
-    }
-    for y in 29..32 {
-        for x in 5..31 {
-            put(x, y);
-        }
-    }
-    Icon::from_rgba(rgba, n as u32, n as u32).expect("tray icon")
+    const BYTES: &[u8] = include_bytes!("../tray.png");
+    let img = image::load_from_memory_with_format(BYTES, image::ImageFormat::Png)
+        .expect("tray.png")
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).expect("tray icon")
 }
 
 /// The update line shown at the top of the menu: (label, clickable).
