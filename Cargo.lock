@@ -3322,8 +3322,8 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skew-egui"
-version = "1.120.0"
-source = "git+https://github.com/TarGz/targz-design-system.git?rev=ac90e9e6c92c7dbba89b2e8e36835bdd672ad47b#ac90e9e6c92c7dbba89b2e8e36835bdd672ad47b"
+version = "1.121.0"
+source = "git+https://github.com/TarGz/targz-design-system.git?branch=master#3474136a11b65aa10a2c7109014a6f50e49aaa96"
 dependencies = [
  "egui",
 ]
@@ -3513,7 +3513,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "targz-launchpad"
-version = "1.4.0"
+version = "1.4.2"
 dependencies = [
  "dispatch",
  "eframe",

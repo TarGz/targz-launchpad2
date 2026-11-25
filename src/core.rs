@@ -28,11 +28,21 @@ pub const WAIT_POLL: Duration = Duration::from_millis(300);
 const TERMINALS: [&str; 2] = ["Terminass", "iTerm"];
 /// Editor order, as stored in the server's constant pool at 0x102d1db2b.
 const EDITORS: [&str; 9] = [
-    "Zed", "Cursor", "Visual Studio Code", "VSCodium", "Windsurf", "Sublime Text", "Nova", "WebStorm", "BBEdit",
+    "Zed",
+    "Cursor",
+    "Visual Studio Code",
+    "VSCodium",
+    "Windsurf",
+    "Sublime Text",
+    "Nova",
+    "WebStorm",
+    "BBEdit",
 ];
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 pub fn resolve(p: &str) -> PathBuf {
@@ -50,7 +60,10 @@ pub fn find_port(s: &str) -> Option<u16> {
         let rest = &s[i + 6..];
         let mut chars = rest.chars();
         if matches!(chars.next(), Some('=') | Some(' ')) {
-            let digits: String = rest[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = rest[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if let Ok(p) = digits.parse::<u16>() {
                 return Some(p);
             }
@@ -68,7 +81,14 @@ fn replace_port(s: &str, with: &str, all: bool) -> String {
         let at = i + off;
         let after = &s[at + 6..];
         let sep_ok = matches!(after.chars().next(), Some('=') | Some(' '));
-        let digits = if sep_ok { after[1..].chars().take_while(|c| c.is_ascii_digit()).count() } else { 0 };
+        let digits = if sep_ok {
+            after[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .count()
+        } else {
+            0
+        };
         if sep_ok && digits > 0 && !done {
             out.push_str(&s[i..at]);
             out.push_str(with);
@@ -95,7 +115,9 @@ fn strip_flag(s: &str, flag: &str, with_value: bool) -> String {
         }
         let mut end = at + flag.len();
         if with_value && out[end..].starts_with('=') {
-            end += out[end..].find(char::is_whitespace).unwrap_or(out.len() - end);
+            end += out[end..]
+                .find(char::is_whitespace)
+                .unwrap_or(out.len() - end);
         }
         out.replace_range(start..end, "");
     }
@@ -119,7 +141,13 @@ fn yml_value(yml: &str, key: &str) -> Option<String> {
 }
 
 fn yml_port(yml: &str) -> Option<u16> {
-    yml_value(yml, "port").and_then(|v| v.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+    yml_value(yml, "port").and_then(|v| {
+        v.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    })
 }
 
 // ── Config (~/.devlauncher.json, shared with the original) ───────────────
@@ -142,10 +170,24 @@ impl Config {
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        let git_dir_label = raw.get("gitDir").and_then(Value::as_str).unwrap_or(DEFAULT_GIT_DIR).to_string();
-        let auto_port = raw.get("autoPortStart").and_then(Value::as_u64).map(|p| p as u16).unwrap_or(DEFAULT_AUTO_PORT);
+        let git_dir_label = raw
+            .get("gitDir")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_GIT_DIR)
+            .to_string();
+        let auto_port = raw
+            .get("autoPortStart")
+            .and_then(Value::as_u64)
+            .map(|p| p as u16)
+            .unwrap_or(DEFAULT_AUTO_PORT);
         let strings = |v: &Value| -> Vec<String> {
-            v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         let (folders, mut items) = if let Some(f) = raw.get("folders") {
             let folders = strings(f);
@@ -159,13 +201,24 @@ impl Config {
         } else {
             // First run on an old config: seed Favorites from legacy favorites.
             let fav = raw.get("favorites").map(strings).unwrap_or_default();
-            (vec!["Favorites".to_string()], HashMap::from([("Favorites".to_string(), fav)]))
+            (
+                vec!["Favorites".to_string()],
+                HashMap::from([("Favorites".to_string(), fav)]),
+            )
         };
         for f in &folders {
             items.entry(f.clone()).or_default();
         }
         items.retain(|k, _| folders.contains(k));
-        let mut cfg = Config { path, raw, git_dir: resolve(&git_dir_label), git_dir_label, auto_port, folders, items };
+        let mut cfg = Config {
+            path,
+            raw,
+            git_dir: resolve(&git_dir_label),
+            git_dir_label,
+            auto_port,
+            folders,
+            items,
+        };
         cfg.raw.remove("hidden");
         cfg.raw.remove("favorites");
         cfg.save();
@@ -180,7 +233,10 @@ impl Config {
         r.insert("folders".into(), Value::from(self.folders.clone()));
         let mut obj = Map::new();
         for f in &self.folders {
-            obj.insert(f.clone(), Value::from(self.items.get(f).cloned().unwrap_or_default()));
+            obj.insert(
+                f.clone(),
+                Value::from(self.items.get(f).cloned().unwrap_or_default()),
+            );
         }
         r.insert("folderItems".into(), Value::Object(obj));
         if let Ok(text) = serde_json::to_string_pretty(&Value::Object(r.clone())) {
@@ -189,7 +245,11 @@ impl Config {
     }
 
     pub fn get_str(&self, key: &str) -> Option<String> {
-        self.raw.get(key).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        self.raw
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn next_port(&mut self) -> u16 {
@@ -200,7 +260,15 @@ impl Config {
     }
 
     pub fn folders_for(&self, name: &str) -> Vec<String> {
-        self.folders.iter().filter(|f| self.items.get(*f).is_some_and(|i| i.iter().any(|n| n == name))).cloned().collect()
+        self.folders
+            .iter()
+            .filter(|f| {
+                self.items
+                    .get(*f)
+                    .is_some_and(|i| i.iter().any(|n| n == name))
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn create_folder(&mut self, name: &str) -> Result<(), String> {
@@ -219,7 +287,9 @@ impl Config {
 
     pub fn rename_folder(&mut self, from: &str, to: &str) -> Result<(), String> {
         let to = to.trim();
-        let Some(idx) = self.folders.iter().position(|f| f == from) else { return Err("Folder not found".into()) };
+        let Some(idx) = self.folders.iter().position(|f| f == from) else {
+            return Err("Folder not found".into());
+        };
         if to.is_empty() {
             return Err("Folder name required".into());
         }
@@ -276,7 +346,10 @@ fn read_json(path: &Path) -> Option<Value> {
 
 fn dev_script(pkg: &Value) -> Option<String> {
     let s = pkg.get("scripts")?;
-    s.get("dev").and_then(Value::as_str).or_else(|| s.get("start").and_then(Value::as_str)).map(String::from)
+    s.get("dev")
+        .and_then(Value::as_str)
+        .or_else(|| s.get("start").and_then(Value::as_str))
+        .map(String::from)
 }
 
 /// A directory is a project when it is one of the three things this launcher
@@ -300,13 +373,21 @@ fn scan_single(name: &str, dir: &Path) -> Option<Project> {
             default_port = yml_port(&yml);
         }
         if default_port.is_none() {
-            default_port = fs::read_to_string(dir.join("startlocaldev.sh")).ok().as_deref().and_then(find_port);
+            default_port = fs::read_to_string(dir.join("startlocaldev.sh"))
+                .ok()
+                .as_deref()
+                .and_then(find_port);
         }
     }
     if !found && dir.join("index.html").exists() {
         found = true;
     }
-    found.then(|| Project { name: name.to_string(), path: dir.to_path_buf(), default_port, group: None })
+    found.then(|| Project {
+        name: name.to_string(),
+        path: dir.to_path_buf(),
+        default_port,
+        group: None,
+    })
 }
 
 fn listable(entry: &fs::DirEntry) -> Option<String> {
@@ -318,7 +399,9 @@ fn listable(entry: &fs::DirEntry) -> Option<String> {
 /// Git repos at the top level; other folders are opened one level deep.
 pub fn scan(git_dir: &Path) -> Vec<Project> {
     let mut out = vec![];
-    let Ok(entries) = fs::read_dir(git_dir) else { return out };
+    let Ok(entries) = fs::read_dir(git_dir) else {
+        return out;
+    };
     for e in entries.flatten() {
         let Some(name) = listable(&e) else { continue };
         if SELF_REPOS.contains(&name.as_str()) {
@@ -349,10 +432,17 @@ fn detect_port(dir: &Path) -> Option<u16> {
         }
     }
     if dir.join("_config.yml").exists() {
-        if let Some(p) = fs::read_to_string(dir.join("_config.yml")).ok().as_deref().and_then(yml_port) {
+        if let Some(p) = fs::read_to_string(dir.join("_config.yml"))
+            .ok()
+            .as_deref()
+            .and_then(yml_port)
+        {
             return Some(p);
         }
-        return fs::read_to_string(dir.join("startlocaldev.sh")).ok().as_deref().and_then(find_port);
+        return fs::read_to_string(dir.join("startlocaldev.sh"))
+            .ok()
+            .as_deref()
+            .and_then(find_port);
     }
     None
 }
@@ -366,7 +456,13 @@ pub fn listeners(port: u16) -> Vec<i32> {
         .args(["-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
         .stderr(Stdio::null())
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).filter(|p| *p != me).collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .filter(|p| *p != me)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -385,10 +481,14 @@ fn alive(pid: i32) -> bool {
 /// Any HTTP answer counts as ready (IPv4 or IPv6 localhost).
 fn answers(port: u16) -> bool {
     for addr in [format!("127.0.0.1:{port}"), format!("[::1]:{port}")] {
-        let Ok(sa) = addr.parse::<SocketAddr>() else { continue };
+        let Ok(sa) = addr.parse::<SocketAddr>() else {
+            continue;
+        };
         if let Ok(mut s) = TcpStream::connect_timeout(&sa, Duration::from_millis(500)) {
             let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-            if s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_ok() {
+            if s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                .is_ok()
+            {
                 let mut b = [0u8; 1];
                 if matches!(s.read(&mut b), Ok(n) if n > 0) {
                     return true;
@@ -416,7 +516,10 @@ fn wait_for_server(port: u16, timeout: Duration) -> bool {
 /// `npm` usually lives in Homebrew or nvm.
 pub fn login_path() -> String {
     let base = std::env::var("PATH").unwrap_or_default();
-    let fallback = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}:{base}", home().join(".cargo/bin").display());
+    let fallback = format!(
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}:{base}",
+        home().join(".cargo/bin").display()
+    );
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let Ok(mut child) = Command::new(shell)
         .args(["-ilc", "printf '\\n__PATH__%s\\n' \"$PATH\""])
@@ -517,7 +620,10 @@ impl Core {
             busy: HashMap::new(),
             reports: HashMap::new(),
             toasts: vec![],
-            path_env: format!("/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default()),
+            path_env: format!(
+                "/opt/homebrew/bin:/usr/local/bin:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
             update: UpdateState::default(),
         };
         core.adopt_running();
@@ -532,12 +638,21 @@ impl Core {
     fn adopt_running(&mut self) {
         let mut claimed = vec![];
         for p in &self.projects {
-            let Some(port) = detect_port(&p.path) else { continue };
+            let Some(port) = detect_port(&p.path) else {
+                continue;
+            };
             if claimed.contains(&port) {
                 continue;
             }
             if let Some(pid) = listeners(port).first() {
-                self.running.insert(p.name.clone(), Run { pid: *pid, port, child: None });
+                self.running.insert(
+                    p.name.clone(),
+                    Run {
+                        pid: *pid,
+                        port,
+                        child: None,
+                    },
+                );
                 claimed.push(port);
             }
         }
@@ -548,7 +663,9 @@ impl Core {
     }
 
     fn port_taken(&self, port: u16, name: &str) -> bool {
-        self.running.iter().any(|(k, v)| v.port == port && k != name)
+        self.running
+            .iter()
+            .any(|(k, v)| v.port == port && k != name)
     }
 
     /// Picks the port and spawns the command. Returns (port, health timeout).
@@ -599,7 +716,12 @@ impl Core {
                 .ok()
                 .as_deref()
                 .and_then(find_port)
-                .or_else(|| fs::read_to_string(&jekyll).ok().as_deref().and_then(yml_port));
+                .or_else(|| {
+                    fs::read_to_string(&jekyll)
+                        .ok()
+                        .as_deref()
+                        .and_then(yml_port)
+                });
             let mut port = match found {
                 Some(p) => p,
                 None => self.cfg.next_port(),
@@ -617,12 +739,19 @@ impl Core {
                     }
                     let rest = &sh[at + 17..];
                     let ws = rest.len() - rest.trim_start().len();
-                    let digits = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).count();
+                    let digits = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count();
                     sh.replace_range(start..at + 17 + ws + digits, "");
                 }
                 sh = strip_flag(&sh, "--livereload", false);
                 sh = strip_flag(&sh, "--open", false);
-                sh.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).collect::<Vec<_>>().join(" && ")
+                sh.lines()
+                    .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
             } else if dir.join("Gemfile").exists() {
                 format!("bundle exec jekyll serve --port {port}")
             } else {
@@ -630,7 +759,12 @@ impl Core {
             };
             let h = home();
             let mut path = base_path;
-            for extra in ["/opt/homebrew/opt/ruby/bin".into(), "/usr/local/opt/ruby/bin".into(), h.join(".rbenv/shims"), h.join(".rvm/bin")] {
+            for extra in [
+                "/opt/homebrew/opt/ruby/bin".into(),
+                "/usr/local/opt/ruby/bin".into(),
+                h.join(".rbenv/shims"),
+                h.join(".rvm/bin"),
+            ] {
                 let extra: PathBuf = extra;
                 if extra.exists() {
                     path = format!("{}:{path}", extra.display());
@@ -656,7 +790,13 @@ impl Core {
                 port = self.cfg.next_port();
             }
             let child = Command::new("npx")
-                .args(["live-server", ".", &format!("--port={port}"), "--no-browser", "--quiet"])
+                .args([
+                    "live-server",
+                    ".",
+                    &format!("--port={port}"),
+                    "--no-browser",
+                    "--quiet",
+                ])
                 .current_dir(&dir)
                 .env("PATH", base_path)
                 .stdin(Stdio::null())
@@ -672,16 +812,30 @@ impl Core {
     }
 
     fn register(&mut self, name: &str, child: Child, port: u16) {
-        let stale: Vec<String> = self.running.iter().filter(|(k, v)| v.port == port && *k != name).map(|(k, _)| k.clone()).collect();
+        let stale: Vec<String> = self
+            .running
+            .iter()
+            .filter(|(k, v)| v.port == port && *k != name)
+            .map(|(k, _)| k.clone())
+            .collect();
         for k in stale {
             self.running.remove(&k);
         }
         let pid = child.id() as i32;
-        self.running.insert(name.to_string(), Run { pid, port, child: Some(child) });
+        self.running.insert(
+            name.to_string(),
+            Run {
+                pid,
+                port,
+                child: Some(child),
+            },
+        );
     }
 
     pub fn stop(&mut self, name: &str) {
-        let Some(run) = self.running.remove(name) else { return };
+        let Some(run) = self.running.remove(name) else {
+            return;
+        };
         unsafe {
             if libc::kill(-run.pid, libc::SIGTERM) != 0 {
                 libc::kill(run.pid, libc::SIGTERM);
@@ -704,9 +858,16 @@ impl Core {
 
     /// Drop servers that died on their own; re-adopt one that re-forked.
     pub fn check_alive(&mut self) {
-        let names: Vec<String> = self.running.keys().filter(|n| !self.busy.contains_key(*n)).cloned().collect();
+        let names: Vec<String> = self
+            .running
+            .keys()
+            .filter(|n| !self.busy.contains_key(*n))
+            .cloned()
+            .collect();
         for n in names {
-            let Some(run) = self.running.get_mut(&n) else { continue };
+            let Some(run) = self.running.get_mut(&n) else {
+                continue;
+            };
             let gone = match run.child.as_mut() {
                 Some(c) => matches!(c.try_wait(), Ok(Some(_))),
                 None => !alive(run.pid),
@@ -726,7 +887,11 @@ impl Core {
     }
 
     pub fn running_list(&self) -> Vec<(String, u16)> {
-        let mut v: Vec<(String, u16)> = self.running.iter().map(|(k, r)| (k.clone(), r.port)).collect();
+        let mut v: Vec<(String, u16)> = self
+            .running
+            .iter()
+            .map(|(k, r)| (k.clone(), r.port))
+            .collect();
         v.sort();
         v
     }
@@ -768,12 +933,19 @@ fn start_blocking(shared: &Shared, name: &str) {
                     c.reports.remove(name);
                 }
                 false => {
-                    c.reports.insert(name.to_string(), Report::Fail(format!("no answer on :{port} yet")));
+                    c.reports.insert(
+                        name.to_string(),
+                        Report::Fail(format!("no answer on :{port} yet")),
+                    );
                 }
             }
         }
         Err(e) => {
-            shared.lock().unwrap().reports.insert(name.to_string(), Report::Fail(e));
+            shared
+                .lock()
+                .unwrap()
+                .reports
+                .insert(name.to_string(), Report::Fail(e));
         }
     }
 }
@@ -798,7 +970,9 @@ pub fn restart_async(shared: &Shared, name: String, on_done: impl Fn() + Send + 
 // ── Opening things ─────────────────────────────────────────────────────
 
 pub fn open_url(port: u16) {
-    let _ = Command::new("open").arg(format!("http://localhost:{port}")).spawn();
+    let _ = Command::new("open")
+        .arg(format!("http://localhost:{port}"))
+        .spawn();
 }
 
 pub fn open_finder(dir: &Path) {
@@ -809,10 +983,18 @@ pub fn open_finder(dir: &Path) {
 pub fn open_editor(cfg: &Config, dir: &Path) -> Result<String, String> {
     let editor = cfg.get_str("editor").or_else(|| {
         let dirs = [PathBuf::from("/Applications"), home().join("Applications")];
-        EDITORS.iter().find(|app| dirs.iter().any(|d| d.join(format!("{app}.app")).exists())).map(|s| s.to_string())
+        EDITORS
+            .iter()
+            .find(|app| dirs.iter().any(|d| d.join(format!("{app}.app")).exists()))
+            .map(|s| s.to_string())
     });
     let editor = editor.ok_or("No code editor found in /Applications")?;
-    Command::new("open").arg("-a").arg(&editor).arg(dir).spawn().map_err(|e| e.to_string())?;
+    Command::new("open")
+        .arg("-a")
+        .arg(&editor)
+        .arg(dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(editor)
 }
 
@@ -824,10 +1006,18 @@ pub fn open_terminal(cfg: &Config, dir: &Path) -> Result<String, String> {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             let dirs = [PathBuf::from("/Applications"), home().join("Applications")];
-            TERMINALS.iter().find(|app| dirs.iter().any(|d| d.join(format!("{app}.app")).exists())).map(|s| s.to_string())
+            TERMINALS
+                .iter()
+                .find(|app| dirs.iter().any(|d| d.join(format!("{app}.app")).exists()))
+                .map(|s| s.to_string())
         })
         .unwrap_or_else(|| "Terminal".to_string());
-    Command::new("open").arg("-a").arg(&term).arg(dir).spawn().map_err(|e| e.to_string())?;
+    Command::new("open")
+        .arg("-a")
+        .arg(&term)
+        .arg(dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(term)
 }
 
@@ -839,8 +1029,17 @@ mod tests {
         assert_eq!(find_port("exec node server.js --port 5173"), Some(5173));
         assert_eq!(find_port("vite --port=3000 --open"), Some(3000));
         assert_eq!(find_port("vite"), None);
-        assert_eq!(replace_port("vite --port 3000 --x", "--port=2851", true), "vite --port=2851 --x");
-        assert_eq!(strip_flag("vite --open --port 1", "--open", true), "vite --port 1");
-        assert_eq!(strip_flag("vite --open=/a --host", "--open", true), "vite --host");
+        assert_eq!(
+            replace_port("vite --port 3000 --x", "--port=2851", true),
+            "vite --port=2851 --x"
+        );
+        assert_eq!(
+            strip_flag("vite --open --port 1", "--open", true),
+            "vite --port 1"
+        );
+        assert_eq!(
+            strip_flag("vite --open=/a --host", "--open", true),
+            "vite --host"
+        );
     }
 }

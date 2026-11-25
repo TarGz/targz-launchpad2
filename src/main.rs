@@ -13,7 +13,11 @@ use std::time::Duration;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let shot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let shot = args
+        .iter()
+        .position(|a| a == "--screenshot")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
 
     let shared: core::Shared = Arc::new(Mutex::new(core::Core::new()));
 
@@ -47,7 +51,11 @@ fn main() -> eframe::Result<()> {
             viewport = viewport.with_window_level(eframe::egui::WindowLevel::AlwaysOnBottom);
         }
     }
-    let mut options = eframe::NativeOptions { viewport, run_and_return: false, ..Default::default() };
+    let mut options = eframe::NativeOptions {
+        viewport,
+        run_and_return: false,
+        ..Default::default()
+    };
     #[cfg(target_os = "macos")]
     if shot.is_some() {
         options.event_loop_builder = Some(Box::new(|b| {

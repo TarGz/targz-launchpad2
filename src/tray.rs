@@ -62,11 +62,21 @@ fn menu(running: &[(String, u16)], update: &UpdateLine) -> Menu {
     }
     if !running.is_empty() {
         for (name, port) in running {
-            let _ = menu.append(&MenuItem::with_id(format!("project_{port}"), format!("{name} :{port}"), true, None));
+            let _ = menu.append(&MenuItem::with_id(
+                format!("project_{port}"),
+                format!("{name} :{port}"),
+                true,
+                None,
+            ));
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
     }
-    let _ = menu.append(&MenuItem::with_id("open_dashboard", "Open Dashboard", true, None));
+    let _ = menu.append(&MenuItem::with_id(
+        "open_dashboard",
+        "Open Dashboard",
+        true,
+        None,
+    ));
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id("quit", "Quit", true, None));
     menu
@@ -116,7 +126,11 @@ pub fn setup(shared: Shared, ctx: eframe::egui::Context) {
 }
 
 fn refresh(running: &[(String, u16)], update: &UpdateLine) {
-    let mut sig = running.iter().map(|(n, p)| format!("{n}:{p}")).collect::<Vec<_>>().join(";");
+    let mut sig = running
+        .iter()
+        .map(|(n, p)| format!("{n}:{p}"))
+        .collect::<Vec<_>>()
+        .join(";");
     if let Some((label, _)) = update {
         sig.push_str("|");
         sig.push_str(label);
@@ -134,7 +148,11 @@ fn refresh(running: &[(String, u16)], update: &UpdateLine) {
         if let Some(tray) = t.borrow().as_ref() {
             let count = running.len();
             tray.set_title(Some(count.to_string()));
-            let tip = if count > 0 { format!("Targz Launchpad - {count} running") } else { "Targz Launchpad - idle".into() };
+            let tip = if count > 0 {
+                format!("Targz Launchpad - {count} running")
+            } else {
+                "Targz Launchpad - idle".into()
+            };
             let _ = tray.set_tooltip(Some(tip));
             tray.set_menu(Some(Box::new(menu(running, update))));
         }
@@ -146,7 +164,11 @@ pub fn set_accessory(accessory: bool) {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     if let Some(mtm) = objc2::MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
-        let policy = if accessory { NSApplicationActivationPolicy::Accessory } else { NSApplicationActivationPolicy::Regular };
+        let policy = if accessory {
+            NSApplicationActivationPolicy::Accessory
+        } else {
+            NSApplicationActivationPolicy::Regular
+        };
         app.setActivationPolicy(policy);
     }
 }
