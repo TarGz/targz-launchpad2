@@ -1,6 +1,6 @@
 [package]
 name = "targz-launchpad"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 description = "Menu-bar launcher for the local dev projects in ~/Documents/GIT"
 
@@ -9,9 +9,14 @@ eframe = "0.29"
 # Skew — the targz design system — as painted egui parts. A git dependency
 # pinned by revision, because CI checks out this repo alone and cannot see
 # ../targz-design-system (rust/skew-egui/README.md, "How an app takes it").
-# Moving this rev is the only way a design-system commit changes these pixels.
+# NO REV: the branch, so a release always takes the parts as they stand. A
+# pinned rev means a design-system commit reaches this app only when somebody
+# remembers to copy a SHA in here, and for twenty-odd commits nobody did — the
+# app built in place used the checkout next door through [patch] below and
+# looked right, while every release went out against a crate from months back.
+# The release workflow refreshes the lock, which is what actually moves it.
 # default-features = false: the crate's key-click sound bank stays off.
-skew-egui = { git = "https://github.com/TarGz/targz-design-system.git", rev = "ac90e9e6c92c7dbba89b2e8e36835bdd672ad47b", default-features = false }
+skew-egui = { git = "https://github.com/TarGz/targz-design-system.git", branch = "master", default-features = false }
 winit = "0.30"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -22,6 +22,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Cargo.lock remembers the commit the branch pointed at last time, so
+      # without this the runner would keep rebuilding that one however many
+      # times Skew moved on. This is the step that makes "branch" mean latest.
+      - name: Take Skew as it stands
+        run: cargo update -p skew-egui
+
       - name: Build the app (Apple Silicon + Intel)
         env:
           LAUNCHPAD_BUILD: ${{ github.run_number }}
